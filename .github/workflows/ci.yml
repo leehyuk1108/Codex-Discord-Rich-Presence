@@ -11,8 +11,6 @@ jobs:
   lint-test-build:
     name: Lint, Test, Build (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    env:
-      CARGO_TARGET_DIR: releases/.cargo-target
     strategy:
       fail-fast: false
       matrix:

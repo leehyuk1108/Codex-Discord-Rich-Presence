@@ -8,7 +8,7 @@ use crossterm::cursor::{Hide, MoveTo, Show};
 use crossterm::execute;
 use crossterm::style::{Color, Stylize};
 use crossterm::terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen};
-use viuer::{Config as ViuerConfig, KittySupport};
+use viuer::Config as ViuerConfig;
 
 use crate::config::TerminalLogoMode;
 use crate::metrics::MetricsSnapshot;
@@ -41,14 +41,11 @@ const CODEX_ASCII: [&str; 8] = [
     " | |     | |  | || |  | ||  __|     > <     ",
     " | |____ | |__| || |__| || |____   / . \\    ",
     "  \\_____| \\____/ |_____/ |______| /_/ \\_\\   ",
-    "       Discord Presence for Codex CLI        ",
-    "       Live activity + limits telemetry      ",
+    "   Presence for CLI/VS Code + Desktop App    ",
+    "       Live activity + account usage         ",
 ];
 
-const COMPACT_BANNER: [&str; 2] = [
-    "OPENAI x CODEX PRESENCE",
-    "Live activity + limits telemetry",
-];
+const COMPACT_BANNER: [&str; 2] = ["OPENAI x CODEX PRESENCE", "Live activity + account usage"];
 
 const MINIMAL_BANNER: &str = "CODEX Presence";
 const BANNER_TEXT_ROWS: u16 = 2;
@@ -67,6 +64,14 @@ pub enum UiLayoutMode {
     Full,
     Compact,
     Minimal,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BannerRenderOptions<'a> {
+    layout: UiLayoutMode,
+    logo_mode: &'a TerminalLogoMode,
+    logo_path: Option<&'a str>,
+    phase: u8,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -99,9 +104,14 @@ pub struct RenderData<'a> {
     pub stale_secs: u64,
     pub show_activity: bool,
     pub show_activity_target: bool,
-    pub openai_plan_label: &'a str,
+    pub plan_display_label: &'a str,
+    pub plan_auto_label: &'a str,
+    pub limits_source_label: &'a str,
+    pub limits_updated_label: &'a str,
+    pub spark_plan_warning: Option<&'a str>,
     pub logo_mode: TerminalLogoMode,
     pub logo_path: Option<&'a str>,
+    pub banner_phase: u8,
     pub active: Option<&'a CodexSessionSnapshot>,
     pub effective_limits: Option<&'a RateLimits>,
     pub metrics: Option<&'a MetricsSnapshot>,
@@ -139,15 +149,13 @@ pub fn draw(data: &RenderData<'_>) -> Result<()> {
     execute!(out, MoveTo(0, 0), Clear(ClearType::All))?;
 
     let mut row = 0u16;
-    draw_banner(
-        &mut out,
-        &mut row,
-        top_body_limit,
-        w,
+    let banner_options = BannerRenderOptions {
         layout,
-        &data.logo_mode,
-        data.logo_path,
-    )?;
+        logo_mode: &data.logo_mode,
+        logo_path: data.logo_path,
+        phase: data.banner_phase,
+    };
+    draw_banner(&mut out, &mut row, top_body_limit, w, banner_options)?;
     write_section_gap(&mut out, &mut row, top_body_limit, w, layout)?;
 
     render_runtime_section(&mut out, &mut row, top_body_limit, w, layout, data)?;
@@ -173,14 +181,20 @@ pub fn frame_signature(data: &RenderData<'_>) -> String {
     let mut signature = String::with_capacity(768);
     let _ = write!(
         signature,
-        "{}|{}|{}|{}|{}|{}|{}|",
+        "{}|{}|{}|{}|{}|{}|{}|{}|",
         data.mode_label,
         data.discord_status,
         data.client_id_configured,
         data.show_activity,
         data.show_activity_target,
-        data.openai_plan_label,
-        data.sessions.len()
+        data.plan_display_label,
+        data.sessions.len(),
+        data.banner_phase
+    );
+    let _ = write!(
+        signature,
+        "plan:{}|ls:{}|lu:{}|",
+        data.plan_auto_label, data.limits_source_label, data.limits_updated_label
     );
 
     if let Some(active) = data.active {
@@ -280,7 +294,10 @@ fn render_runtime_section(
     }
 
     if matches!(layout, UiLayoutMode::Full) {
-        lines.push(kv_line("Limits Mode", "remaining (Codex CLI parity)"));
+        lines.push(kv_line(
+            "Quota Policy",
+            "Prioritize account-wide quota (/codex)",
+        ));
     }
 
     for line in lines {
@@ -350,7 +367,7 @@ fn render_active_section(
     let model_line = format!(
         "{} | {}",
         format_model_name(active.model.as_deref().unwrap_or("unknown")),
-        data.openai_plan_label
+        data.plan_display_label
     );
     if !write_line(
         out,
@@ -383,6 +400,57 @@ fn render_active_section(
     )? {
         return Ok(());
     }
+    if matches!(layout, UiLayoutMode::Minimal) {
+        let account_line = format!("{} | {}", data.plan_auto_label, data.limits_updated_label);
+        if !write_line(
+            out,
+            row,
+            max_body_row,
+            width,
+            &kv_line("Account", &account_line),
+        )? {
+            return Ok(());
+        }
+    } else {
+        if !write_line(
+            out,
+            row,
+            max_body_row,
+            width,
+            &kv_line("Account Type", data.plan_auto_label),
+        )? {
+            return Ok(());
+        }
+        if !write_line(
+            out,
+            row,
+            max_body_row,
+            width,
+            &kv_line("Quota Source", data.limits_source_label),
+        )? {
+            return Ok(());
+        }
+        if !write_line(
+            out,
+            row,
+            max_body_row,
+            width,
+            &kv_line("Quota Sync", data.limits_updated_label),
+        )? {
+            return Ok(());
+        }
+    }
+    if let Some(warning) = data.spark_plan_warning
+        && !write_line(
+            out,
+            row,
+            max_body_row,
+            width,
+            &kv_line("Model Gate", warning),
+        )?
+    {
+        return Ok(());
+    }
 
     if !matches!(layout, UiLayoutMode::Minimal) {
         let token_line = format_token_triplet(
@@ -406,8 +474,8 @@ fn render_active_section(
 
     let limits = data.effective_limits.unwrap_or(&active.limits);
     if max_body_row.saturating_sub(*row) == 1 {
-        let summary = render_compact_limits_row(limits);
-        let _ = write_line(out, row, max_body_row, width, &summary);
+        let summary = render_compact_limits_row(limits, width);
+        let _ = write_line_unchecked(out, row, max_body_row, &summary);
         return Ok(());
     }
 
@@ -634,25 +702,29 @@ fn draw_banner(
     row: &mut u16,
     max_body_row: u16,
     width: usize,
-    layout: UiLayoutMode,
-    logo_mode: &TerminalLogoMode,
-    logo_path: Option<&str>,
+    options: BannerRenderOptions<'_>,
 ) -> Result<()> {
     if *row >= max_body_row {
         return Ok(());
     }
 
     let available_rows = max_body_row.saturating_sub(*row);
-    let mut allow_image = matches!(layout, UiLayoutMode::Full)
-        && !matches!(logo_mode, TerminalLogoMode::Ascii)
-        && logo_path.is_some();
+    let effective_logo_path = resolve_effective_logo_path(options.logo_path);
+    let mut allow_image = matches!(options.logo_mode, TerminalLogoMode::Image)
+        && !matches!(options.layout, UiLayoutMode::Minimal)
+        && effective_logo_path.is_some();
 
     loop {
-        match select_banner_variant(width, available_rows, layout, allow_image) {
+        match select_banner_variant(width, available_rows, options.layout, allow_image) {
             BannerVariant::Image => {
-                if let Some(used_rows) =
-                    try_draw_logo_image(out, *row, max_body_row, width, logo_mode, logo_path)?
-                {
+                if let Some(used_rows) = try_draw_logo_image(
+                    out,
+                    *row,
+                    max_body_row,
+                    width,
+                    options.logo_mode,
+                    effective_logo_path.as_deref(),
+                )? {
                     *row = row.saturating_add(used_rows);
                     let _ = write_line(
                         out,
@@ -666,18 +738,18 @@ fn draw_banner(
                         row,
                         max_body_row,
                         width,
-                        &center_line("Live activity + limits telemetry", width),
+                        &center_line("Live activity + account usage", width),
                     )?;
                     return Ok(());
                 }
                 allow_image = false;
             }
             BannerVariant::AsciiDual => {
-                draw_dual_ascii_banner(out, row, max_body_row, width)?;
+                draw_dual_ascii_banner(out, row, max_body_row, width, options.phase)?;
                 return Ok(());
             }
             BannerVariant::AsciiCodex => {
-                draw_codex_ascii_banner(out, row, max_body_row, width)?;
+                draw_codex_ascii_banner(out, row, max_body_row, width, options.phase)?;
                 return Ok(());
             }
             BannerVariant::CompactText => {
@@ -707,6 +779,7 @@ fn draw_dual_ascii_banner(
     row: &mut u16,
     max_body_row: u16,
     width: usize,
+    phase: u8,
 ) -> Result<()> {
     let left_width = banner_ascii_width(&OPENAI_ASCII);
     let right_width = banner_ascii_width(&CODEX_ASCII);
@@ -718,11 +791,12 @@ fn draw_dual_ascii_banner(
     for idx in 0..OPENAI_ASCII.len().max(CODEX_ASCII.len()) {
         let left = OPENAI_ASCII.get(idx).copied().unwrap_or("");
         let right = CODEX_ASCII.get(idx).copied().unwrap_or("");
+        let right = style_codex_banner_line(right, idx, phase);
         let line = format!(
             "{left_pad}{left:<left_width$}{spacer}{right}",
             left_width = left_width
         );
-        if !write_line(out, row, max_body_row, width, &line)? {
+        if !write_line_unchecked(out, row, max_body_row, &line)? {
             break;
         }
     }
@@ -735,22 +809,44 @@ fn draw_codex_ascii_banner(
     row: &mut u16,
     max_body_row: u16,
     width: usize,
+    phase: u8,
 ) -> Result<()> {
     let codex_width = banner_ascii_width(&CODEX_ASCII);
     let left_pad = " ".repeat(width.saturating_sub(codex_width) / 2);
-    for text in CODEX_ASCII {
-        let line = format!("{left_pad}{text}");
-        if !write_line(out, row, max_body_row, width, &line)? {
+    for (idx, text) in CODEX_ASCII.into_iter().enumerate() {
+        let line = format!("{left_pad}{}", style_codex_banner_line(text, idx, phase));
+        if !write_line_unchecked(out, row, max_body_row, &line)? {
             break;
         }
     }
     Ok(())
 }
 
+fn style_codex_banner_line(text: &str, line_index: usize, phase: u8) -> String {
+    if text.trim().is_empty() {
+        return text.to_string();
+    }
+
+    // Monochrome OpenAI-like palette: white logo strokes over black background.
+    let pulse_line = usize::from(phase) % 6;
+    let styled = if line_index < 6 {
+        if line_index == pulse_line {
+            text.with(Color::White).bold()
+        } else {
+            text.with(Color::Grey)
+        }
+    } else if line_index == 6 {
+        text.with(Color::White)
+    } else {
+        text.with(Color::Grey)
+    };
+    styled.to_string()
+}
+
 fn select_banner_variant(
     width: usize,
     available_rows: u16,
-    layout: UiLayoutMode,
+    _layout: UiLayoutMode,
     allow_image: bool,
 ) -> BannerVariant {
     let left_width = banner_ascii_width(&OPENAI_ASCII);
@@ -766,10 +862,7 @@ fn select_banner_variant(
     if allow_image && available_rows >= image_rows {
         return BannerVariant::Image;
     }
-    if matches!(layout, UiLayoutMode::Full)
-        && width >= dual_min_width
-        && available_rows >= dual_rows
-    {
+    if width >= dual_min_width && available_rows >= dual_rows {
         return BannerVariant::AsciiDual;
     }
     if width >= codex_min_width && available_rows >= codex_rows {
@@ -792,17 +885,16 @@ fn try_draw_logo_image(
     max_body_row: u16,
     width: usize,
     logo_mode: &TerminalLogoMode,
-    logo_path: Option<&str>,
+    logo_path: Option<&Path>,
 ) -> Result<Option<u16>> {
     if matches!(logo_mode, TerminalLogoMode::Ascii) {
         return Ok(None);
     }
 
-    let Some(raw_path) = logo_path else {
+    let Some(path) = logo_path else {
         return Ok(None);
     };
-    let path = resolve_logo_path(raw_path);
-    if !path.exists() || !terminal_supports_logo_image() {
+    if !path.exists() {
         return Ok(None);
     }
 
@@ -816,8 +908,8 @@ fn try_draw_logo_image(
         return Ok(None);
     }
 
+    // Let viuer choose best available renderer (Sixel/Kitty/iTerm/Block).
     let x_offset = width.saturating_sub(image_width_cells as usize) / 2;
-
     let conf = ViuerConfig {
         transparent: true,
         absolute_offset: false,
@@ -829,7 +921,7 @@ fn try_draw_logo_image(
     };
 
     out.flush()?;
-    if viuer::print_from_file(&path, &conf).is_ok() {
+    if viuer::print_from_file(path, &conf).is_ok() {
         return Ok(Some(approx_rows));
     }
 
@@ -956,9 +1048,10 @@ fn render_limit_row(label: &str, window: &UsageWindow, width: usize) -> String {
     format!("{label} remaining [{pct}] {bar} reset {reset}")
 }
 
-fn render_compact_limits_row(limits: &RateLimits) -> String {
-    let primary = limit_percent_text(limits.primary.as_ref());
-    let secondary = limit_percent_text(limits.secondary.as_ref());
+fn render_compact_limits_row(limits: &RateLimits, width: usize) -> String {
+    let bar_width = if width >= 90 { 8 } else { 6 };
+    let primary = compact_limit_text(limits.primary.as_ref(), bar_width);
+    let secondary = compact_limit_text(limits.secondary.as_ref(), bar_width);
     format!("Usage: 5h {primary} | 7d {secondary}")
 }
 
@@ -966,6 +1059,17 @@ fn limit_percent_text(window: Option<&UsageWindow>) -> String {
     window
         .map(|item| format!("{:.0}%", item.remaining_percent.clamp(0.0, 100.0)))
         .unwrap_or_else(|| "n/a".to_string())
+}
+
+fn compact_limit_text(window: Option<&UsageWindow>, bar_width: usize) -> String {
+    let Some(window) = window else {
+        return "n/a".to_string();
+    };
+    let color = limit_color(window.remaining_percent);
+    let pct_plain = limit_percent_text(Some(window));
+    let pct = pct_plain.with(color).bold();
+    let bar = progress_bar(window.remaining_percent, bar_width).with(color);
+    format!("{pct} {bar}")
 }
 
 fn limit_bar_width(width: usize) -> usize {
@@ -1033,8 +1137,10 @@ fn reserved_recent_rows(layout: UiLayoutMode, max_body_row: u16) -> u16 {
     preferred.min(max_body_row)
 }
 
-fn terminal_supports_logo_image() -> bool {
-    viuer::is_iterm_supported() || viuer::get_kitty_support() != KittySupport::None
+fn resolve_effective_logo_path(raw_path: Option<&str>) -> Option<PathBuf> {
+    let value = raw_path?;
+    let resolved = resolve_logo_path(value);
+    resolved.exists().then_some(resolved)
 }
 
 fn resolve_logo_path(raw_path: &str) -> PathBuf {
@@ -1134,15 +1240,23 @@ mod tests {
     fn banner_variant_targets_requested_window_sizes() {
         assert_eq!(
             select_banner_variant(80, 17, UiLayoutMode::Compact, false),
-            BannerVariant::AsciiCodex
+            BannerVariant::AsciiDual
         );
         assert_eq!(
             select_banner_variant(100, 24, UiLayoutMode::Compact, false),
-            BannerVariant::AsciiCodex
+            BannerVariant::AsciiDual
         );
         assert_eq!(
             select_banner_variant(120, 28, UiLayoutMode::Full, false),
             BannerVariant::AsciiDual
+        );
+    }
+
+    #[test]
+    fn banner_variant_allows_image_in_compact_when_enabled() {
+        assert_eq!(
+            select_banner_variant(100, 20, UiLayoutMode::Compact, true),
+            BannerVariant::Image
         );
     }
 

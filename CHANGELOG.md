@@ -7,7 +7,7 @@ All notable changes to this project are documented in this file.
 ### Changed
 
 - Build/release output layout is now standardized under `releases/` only.
-- Cargo target output root moved from `dist/target` / `.build/target` to `releases/.cargo-target`.
+- Cargo target output root moved from `dist/target` / `.build/target` to `releases/_build-cache`.
 - Release packaging paths updated:
   - Windows: `releases/windows/x64/{executables,archives}`
   - Linux: `releases/linux/distros/x64/{executables,archives}`

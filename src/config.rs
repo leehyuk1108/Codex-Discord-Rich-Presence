@@ -13,8 +13,9 @@ const DEFAULT_STALE_SECONDS: u64 = 90;
 const DEFAULT_POLL_SECONDS: u64 = 2;
 const DEFAULT_ACTIVE_STICKY_SECONDS: u64 = 3600;
 const MIN_ACTIVE_STICKY_SECONDS: u64 = 60;
-const CONFIG_SCHEMA_VERSION: u32 = 5;
+const CONFIG_SCHEMA_VERSION: u32 = 7;
 pub const DEFAULT_DISCORD_CLIENT_ID: &str = "1470480085453770854";
+pub const DEFAULT_DISCORD_DESKTOP_CLIENT_ID: &str = "1478395304624652345";
 pub const DEFAULT_DISCORD_PUBLIC_KEY: &str =
     "29e563eeb755ae71d940c1b11d49dd3282a8886cd8b8cab829b2a14fcedad247";
 
@@ -23,6 +24,7 @@ pub const DEFAULT_DISCORD_PUBLIC_KEY: &str =
 pub struct PresenceConfig {
     pub schema_version: u32,
     pub discord_client_id: Option<String>,
+    pub discord_client_id_desktop: Option<String>,
     pub discord_public_key: Option<String>,
     pub privacy: PrivacyConfig,
     pub display: DisplayConfig,
@@ -57,6 +59,8 @@ pub enum OpenAiPlanTier {
     Free,
     Go,
     Plus,
+    Business,
+    Enterprise,
     #[default]
     Pro,
 }
@@ -67,16 +71,19 @@ impl OpenAiPlanTier {
             Self::Free => "Free",
             Self::Go => "Go",
             Self::Plus => "Plus",
+            Self::Business => "Business",
+            Self::Enterprise => "Enterprise",
             Self::Pro => "Pro",
         }
     }
 
-    pub fn monthly_price_usd(self) -> u32 {
+    pub fn monthly_price_usd(self) -> Option<u32> {
         match self {
-            Self::Free => 0,
-            Self::Go => 8,
-            Self::Plus => 20,
-            Self::Pro => 200,
+            Self::Free => Some(0),
+            Self::Go => Some(8),
+            Self::Plus => Some(20),
+            Self::Pro => Some(200),
+            Self::Business | Self::Enterprise => None,
         }
     }
 }
@@ -89,13 +96,12 @@ pub struct OpenAiPlanDisplayConfig {
 }
 
 impl OpenAiPlanDisplayConfig {
+    // Legacy display helper kept for backwards compatibility; runtime now uses telemetry plan.
     pub fn label(&self) -> String {
-        if self.show_price {
-            return format!(
-                "{} (${}/month)",
-                self.tier.title(),
-                self.tier.monthly_price_usd()
-            );
+        if self.show_price
+            && let Some(monthly) = self.tier.monthly_price_usd()
+        {
+            return format!("{} (${monthly}/month)", self.tier.title());
         }
         self.tier.title().to_string()
     }
@@ -127,11 +133,19 @@ pub enum TerminalLogoMode {
     Image,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PresenceSurface {
+    Default,
+    Desktop,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DisplayConfig {
     pub large_image_key: String,
     pub large_text: String,
+    pub desktop_large_image_key: String,
+    pub desktop_large_text: String,
     pub small_image_key: String,
     pub small_text: String,
     pub activity_small_image_keys: ActivitySmallImageKeys,
@@ -162,6 +176,7 @@ impl Default for PresenceConfig {
         Self {
             schema_version: CONFIG_SCHEMA_VERSION,
             discord_client_id: Some(DEFAULT_DISCORD_CLIENT_ID.to_string()),
+            discord_client_id_desktop: Some(DEFAULT_DISCORD_DESKTOP_CLIENT_ID.to_string()),
             discord_public_key: Some(DEFAULT_DISCORD_PUBLIC_KEY.to_string()),
             privacy: PrivacyConfig::default(),
             display: DisplayConfig::default(),
@@ -202,6 +217,8 @@ impl Default for DisplayConfig {
         Self {
             large_image_key: "codex-logo".to_string(),
             large_text: "Codex".to_string(),
+            desktop_large_image_key: "codex-app".to_string(),
+            desktop_large_text: "Codex App".to_string(),
             small_image_key: "openai".to_string(),
             small_text: "OpenAI".to_string(),
             activity_small_image_keys: ActivitySmallImageKeys::default(),
@@ -217,6 +234,14 @@ impl Default for PricingConfig {
         aliases.insert("gpt-5.3-codex".to_string(), "gpt-5.2-codex".to_string());
         aliases.insert(
             "gpt-5.3-codex-latest".to_string(),
+            "gpt-5.2-codex".to_string(),
+        );
+        aliases.insert(
+            "gpt-5.3-codex-spark".to_string(),
+            "gpt-5.2-codex".to_string(),
+        );
+        aliases.insert(
+            "gpt-5.3-codex-spark-latest".to_string(),
             "gpt-5.2-codex".to_string(),
         );
         Self {
@@ -265,10 +290,27 @@ impl PresenceConfig {
     }
 
     pub fn effective_client_id(&self) -> Option<String> {
-        let from_env = env::var("CODEX_DISCORD_CLIENT_ID")
-            .ok()
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty());
+        self.effective_client_id_for_surface(PresenceSurface::Default)
+    }
+
+    pub fn effective_client_id_for_surface(&self, surface: PresenceSurface) -> Option<String> {
+        if matches!(surface, PresenceSurface::Desktop) {
+            if let Some(desktop_env) = env_client_id("CODEX_DISCORD_CLIENT_ID_DESKTOP") {
+                return Some(desktop_env);
+            }
+            if let Some(configured_desktop) = self
+                .discord_client_id_desktop
+                .as_ref()
+                .and_then(|value| non_empty_trimmed_string(value))
+            {
+                return Some(configured_desktop);
+            }
+        }
+        self.effective_default_client_id()
+    }
+
+    fn effective_default_client_id(&self) -> Option<String> {
+        let from_env = env_client_id("CODEX_DISCORD_CLIENT_ID");
 
         if from_env.is_some() {
             return from_env;
@@ -276,12 +318,12 @@ impl PresenceConfig {
 
         self.discord_client_id
             .as_ref()
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty())
+            .and_then(|value| non_empty_trimmed_string(value))
     }
 
     fn normalize_and_migrate(&mut self) -> bool {
         let mut changed = false;
+        let default_display = DisplayConfig::default();
 
         if self.schema_version < CONFIG_SCHEMA_VERSION {
             self.schema_version = CONFIG_SCHEMA_VERSION;
@@ -292,25 +334,37 @@ impl PresenceConfig {
             self.discord_client_id = Some(DEFAULT_DISCORD_CLIENT_ID.to_string());
             changed = true;
         }
+        if is_missing(&self.discord_client_id_desktop) {
+            self.discord_client_id_desktop = Some(DEFAULT_DISCORD_DESKTOP_CLIENT_ID.to_string());
+            changed = true;
+        }
         if is_missing(&self.discord_public_key) {
             self.discord_public_key = Some(DEFAULT_DISCORD_PUBLIC_KEY.to_string());
             changed = true;
         }
 
         if self.display.large_image_key.trim().is_empty() {
-            self.display.large_image_key = DisplayConfig::default().large_image_key;
+            self.display.large_image_key = default_display.large_image_key;
             changed = true;
         }
         if self.display.large_text.trim().is_empty() {
-            self.display.large_text = DisplayConfig::default().large_text;
+            self.display.large_text = default_display.large_text;
+            changed = true;
+        }
+        if self.display.desktop_large_image_key.trim().is_empty() {
+            self.display.desktop_large_image_key = default_display.desktop_large_image_key;
+            changed = true;
+        }
+        if self.display.desktop_large_text.trim().is_empty() {
+            self.display.desktop_large_text = default_display.desktop_large_text;
             changed = true;
         }
         if self.display.small_image_key.trim().is_empty() {
-            self.display.small_image_key = DisplayConfig::default().small_image_key;
+            self.display.small_image_key = default_display.small_image_key;
             changed = true;
         }
         if self.display.small_text.trim().is_empty() {
-            self.display.small_text = DisplayConfig::default().small_text;
+            self.display.small_text = default_display.small_text;
             changed = true;
         }
         for item in [
@@ -339,6 +393,21 @@ impl PresenceConfig {
         }
 
         changed
+    }
+}
+
+fn env_client_id(name: &str) -> Option<String> {
+    env::var(name)
+        .ok()
+        .and_then(|value| non_empty_trimmed_string(&value))
+}
+
+fn non_empty_trimmed_string(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
     }
 }
 
@@ -444,7 +513,7 @@ fn normalize_pricing_config(pricing: &mut PricingConfig) -> bool {
     let mut changed = false;
 
     let mut normalized_aliases: BTreeMap<String, String> = BTreeMap::new();
-    for (raw_key, raw_target) in pricing.aliases.clone() {
+    for (raw_key, raw_target) in pricing.aliases.iter() {
         let key = raw_key.trim().to_ascii_lowercase();
         let target = raw_target.trim().to_ascii_lowercase();
         if key.is_empty() || target.is_empty() || key == target {
@@ -456,7 +525,7 @@ fn normalize_pricing_config(pricing: &mut PricingConfig) -> bool {
         if normalized_aliases
             .insert(key.clone(), target.clone())
             .is_none()
-            && (key != raw_key || target != raw_target)
+            && (key != raw_key.trim() || target != raw_target.trim())
         {
             changed = true;
         }
@@ -467,7 +536,8 @@ fn normalize_pricing_config(pricing: &mut PricingConfig) -> bool {
     }
 
     let mut normalized_overrides: BTreeMap<String, ModelPricingOverride> = BTreeMap::new();
-    for (raw_key, mut override_pricing) in pricing.overrides.clone() {
+    for (raw_key, source_pricing) in pricing.overrides.iter() {
+        let mut override_pricing = source_pricing.clone();
         let key = raw_key.trim().to_ascii_lowercase();
         if key.is_empty() {
             changed = true;
@@ -493,7 +563,7 @@ fn normalize_pricing_config(pricing: &mut PricingConfig) -> bool {
             changed = true;
         }
 
-        if key != raw_key {
+        if key != raw_key.trim() {
             changed = true;
         }
         normalized_overrides.insert(key, override_pricing);
@@ -679,6 +749,7 @@ mod tests {
     fn configured_client_id_is_returned() {
         let cfg = PresenceConfig {
             discord_client_id: Some("from-config".to_string()),
+            discord_client_id_desktop: None,
             ..PresenceConfig::default()
         };
         assert_eq!(cfg.effective_client_id().as_deref(), Some("from-config"));
@@ -689,6 +760,7 @@ mod tests {
         let mut cfg = PresenceConfig {
             schema_version: 2,
             discord_client_id: None,
+            discord_client_id_desktop: None,
             discord_public_key: None,
             privacy: PrivacyConfig::default(),
             display: DisplayConfig::default(),
@@ -699,10 +771,14 @@ mod tests {
         let changed = cfg.normalize_and_migrate();
 
         assert!(changed);
-        assert_eq!(cfg.schema_version, 5);
+        assert_eq!(cfg.schema_version, 7);
         assert_eq!(
             cfg.discord_client_id.as_deref(),
             Some(DEFAULT_DISCORD_CLIENT_ID)
+        );
+        assert_eq!(
+            cfg.discord_client_id_desktop.as_deref(),
+            Some(DEFAULT_DISCORD_DESKTOP_CLIENT_ID)
         );
         assert_eq!(
             cfg.discord_public_key.as_deref(),
@@ -717,6 +793,22 @@ mod tests {
         let cfg = PresenceConfig::default();
         assert_eq!(cfg.display.terminal_logo_mode, TerminalLogoMode::Auto);
         assert_eq!(cfg.display.terminal_logo_path, None);
+        assert_eq!(cfg.display.desktop_large_image_key, "codex-app");
+        assert_eq!(cfg.display.desktop_large_text, "Codex App");
+    }
+
+    #[test]
+    fn desktop_surface_client_id_uses_desktop_config_when_present() {
+        let cfg = PresenceConfig {
+            discord_client_id: Some("default-id".to_string()),
+            discord_client_id_desktop: Some("desktop-id".to_string()),
+            ..PresenceConfig::default()
+        };
+        assert_eq!(
+            cfg.effective_client_id_for_surface(PresenceSurface::Desktop)
+                .as_deref(),
+            Some("desktop-id")
+        );
     }
 
     #[test]
@@ -724,6 +816,13 @@ mod tests {
         let cfg = PresenceConfig::default();
         assert_eq!(
             cfg.pricing.aliases.get("gpt-5.3-codex").map(String::as_str),
+            Some("gpt-5.2-codex")
+        );
+        assert_eq!(
+            cfg.pricing
+                .aliases
+                .get("gpt-5.3-codex-spark")
+                .map(String::as_str),
             Some("gpt-5.2-codex")
         );
     }

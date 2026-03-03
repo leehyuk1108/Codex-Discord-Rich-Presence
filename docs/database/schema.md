@@ -7,10 +7,11 @@ This project has no relational database.
 ### 1) Config file
 
 - Path: `~/.codex/discord-presence-config.json`
-- Schema version: `5` (non-breaking additions only)
+- Schema version: `7` (non-breaking additions only)
 - Fields:
   - `schema_version: number`
   - `discord_client_id: string | null`
+  - `discord_client_id_desktop: string | null`
   - `discord_public_key: string | null` (metadata only)
   - `privacy: object`
     - `enabled`, `show_project_name`, `show_git_branch`, `show_model`
@@ -18,6 +19,8 @@ This project has no relational database.
   - `display: object`
     - `large_image_key: string` (asset key or `https://` URL)
     - `large_text: string`
+    - `desktop_large_image_key: string` (asset key or `https://` URL)
+    - `desktop_large_text: string`
     - `small_image_key: string` (asset key or `https://` URL)
     - `small_text: string`
     - `activity_small_image_keys: object` (optional)
@@ -33,8 +36,8 @@ This project has no relational database.
     - `aliases: Record<string, string>` (normalized lowercase model keys)
     - `overrides: Record<string, { input_per_million: number, cached_input_per_million?: number, output_per_million: number }>`
   - `openai_plan: object`
-    - `tier: "free" | "go" | "plus" | "pro"`
-    - `show_price: boolean`
+    - `tier: "free" | "go" | "plus" | "business" | "enterprise" | "pro"` (legacy/deprecated at runtime)
+    - `show_price: boolean` (used for auto-detected plan label)
 
 ### Pricing Defaults (Catalog)
 
@@ -43,7 +46,17 @@ This project has no relational database.
 - `gpt-5.1-codex-max`: input `1.25`, cached input `0.125`, output `10.0`
 - `gpt-5.1-codex-mini`: input `0.25`, cached input `0.025`, output `2.0`
 - `gpt-5.3-codex` pricing alias defaults to `gpt-5.2-codex` until official pricing exists.
+- `gpt-5.3-codex-spark` pricing alias defaults to `gpt-5.2-codex` until official pricing exists.
 - Default `openai_plan`: `pro` with `show_price = true`.
+
+### 1b) Plan cache file
+
+- Path: `~/.codex/discord-presence-plan-cache.json`
+- Fields:
+  - `tier: "free" | "go" | "plus" | "business" | "enterprise" | "pro" | "unknown"`
+  - `source: "telemetry" | "memory" | "cache" | "unknown"`
+  - `observed_at: datetime (UTC) | null`
+  - `raw_plan_type: string | null`
 
 ### 2) Lock file
 
@@ -89,6 +102,8 @@ This project has no relational database.
 
 Per session:
 
+- `originator` (from `session_meta.payload.originator`)
+- `source` (string only, from `session_meta.payload.source`)
 - `session_total_tokens`
 - `last_turn_tokens`
 - `session_delta_tokens`
@@ -101,6 +116,17 @@ Per session:
 - `total_cost_usd`
 - `cost_breakdown`
 - `pricing_source`
+- `limits`
+  - `primary`
+  - `secondary`
+- `rate_limit_envelopes[]`
+  - `limit_id`
+  - `limit_name`
+  - `plan_type`
+  - `observed_at`
+  - `scope: "global_codex" | "model_scoped" | "other"`
+  - `limits.primary`
+  - `limits.secondary`
 - `context_window`
   - `window_tokens`
   - `used_tokens`
@@ -159,6 +185,13 @@ Active session ranking:
    - `Waiting for input`
    - `Idle`
 4. stable `session_id` tiebreak.
+
+## Effective Limits Resolution
+
+- Global parity mode:
+  1. prefer freshest envelope with `limit_id = "codex"`,
+  2. fallback to freshest non-global envelope only when global is missing.
+- This prevents model-scoped envelopes (for example `codex_bengalfox`) from overwriting global weekly values.
 
 ## Runtime Parse Cache (In-memory)
 

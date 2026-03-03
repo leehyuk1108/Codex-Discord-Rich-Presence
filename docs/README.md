@@ -1,6 +1,6 @@
 # Docs Index
 
-This folder tracks the runtime contracts and UI/data behavior for `codex-discord-presence`.
+This folder tracks runtime contracts and UI/data behavior for Codex Discord Rich Presence (`codex-discord-presence`).
 
 ## Structure
 

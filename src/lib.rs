@@ -6,5 +6,6 @@ pub mod discord;
 pub mod metrics;
 pub mod process_guard;
 pub mod session;
+pub mod telemetry;
 pub mod ui;
 pub mod util;

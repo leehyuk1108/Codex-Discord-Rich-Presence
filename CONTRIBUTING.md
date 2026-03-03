@@ -1,6 +1,6 @@
 # Contributing
 
-Thanks for contributing to `codex-discord-presence`.
+Thanks for contributing to Codex Discord Rich Presence (`codex-discord-presence`).
 
 ## Development Workflow
 

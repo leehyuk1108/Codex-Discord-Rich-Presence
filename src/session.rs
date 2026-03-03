@@ -7,27 +7,20 @@ use std::process::Command;
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, TimeZone, Utc};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use walkdir::WalkDir;
 
 use crate::config::PricingConfig;
 use crate::cost::{self, PricingSource, TokenCostBreakdown};
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct UsageWindow {
-    pub used_percent: f64,
-    pub remaining_percent: f64,
-    pub window_minutes: u64,
-    pub resets_at: Option<DateTime<Utc>>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct RateLimits {
-    pub primary: Option<UsageWindow>,
-    pub secondary: Option<UsageWindow>,
-}
+pub use crate::telemetry::limits::{
+    EffectiveLimitSelection, RateLimitEnvelope, RateLimitScope, RateLimits, UsageWindow,
+};
+use crate::telemetry::limits::{
+    SessionLimitCandidate, limits_present as telemetry_limits_present, parse_rate_limit_envelope,
+    select_effective_limits_global_first, select_session_envelope_global_first,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
@@ -98,6 +91,8 @@ pub struct CodexSessionSnapshot {
     pub cwd: PathBuf,
     pub project_name: String,
     pub git_branch: Option<String>,
+    pub originator: Option<String>,
+    pub source: Option<String>,
     pub model: Option<String>,
     pub approval_policy: Option<String>,
     pub sandbox_policy: Option<String>,
@@ -115,11 +110,24 @@ pub struct CodexSessionSnapshot {
     pub pricing_source: PricingSource,
     pub context_window: Option<ContextWindowSnapshot>,
     pub limits: RateLimits,
+    pub rate_limit_envelopes: Vec<RateLimitEnvelope>,
     pub activity: Option<SessionActivitySnapshot>,
     pub started_at: Option<DateTime<Utc>>,
     pub last_token_event_at: Option<DateTime<Utc>>,
     pub last_activity: SystemTime,
     pub source_file: PathBuf,
+}
+
+impl CodexSessionSnapshot {
+    pub fn is_desktop_surface(&self) -> bool {
+        self.originator
+            .as_deref()
+            .is_some_and(looks_like_desktop_surface)
+            || self
+                .source
+                .as_deref()
+                .is_some_and(looks_like_desktop_surface)
+    }
 }
 
 #[derive(Debug, Default)]
@@ -139,6 +147,13 @@ pub struct SessionParseCache {
     entries: HashMap<PathBuf, CachedSessionEntry>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct SessionCollectionDiagnostics {
+    pub session_files_seen: usize,
+    pub dropped_stale: usize,
+    pub dropped_outside_sticky: usize,
+}
+
 #[derive(Debug)]
 struct CachedSessionEntry {
     cursor: u64,
@@ -146,6 +161,7 @@ struct CachedSessionEntry {
     modified: SystemTime,
     accumulator: SessionAccumulator,
     snapshot: Option<CodexSessionSnapshot>,
+    partial_line_buffer: String,
 }
 
 impl CachedSessionEntry {
@@ -156,6 +172,7 @@ impl CachedSessionEntry {
             modified,
             accumulator: SessionAccumulator::default(),
             snapshot: None,
+            partial_line_buffer: String::new(),
         }
     }
 
@@ -165,6 +182,7 @@ impl CachedSessionEntry {
         self.modified = modified;
         self.accumulator = SessionAccumulator::default();
         self.snapshot = None;
+        self.partial_line_buffer.clear();
     }
 }
 
@@ -226,6 +244,25 @@ pub fn collect_active_sessions_multi(
     parse_cache: &mut SessionParseCache,
     pricing_config: &PricingConfig,
 ) -> Result<Vec<CodexSessionSnapshot>> {
+    let (sessions, _diagnostics) = collect_active_sessions_multi_with_diagnostics(
+        sessions_roots,
+        stale_threshold,
+        active_sticky_window,
+        git_cache,
+        parse_cache,
+        pricing_config,
+    )?;
+    Ok(sessions)
+}
+
+pub fn collect_active_sessions_multi_with_diagnostics(
+    sessions_roots: &[PathBuf],
+    stale_threshold: Duration,
+    active_sticky_window: Duration,
+    git_cache: &mut GitBranchCache,
+    parse_cache: &mut SessionParseCache,
+    pricing_config: &PricingConfig,
+) -> Result<(Vec<CodexSessionSnapshot>, SessionCollectionDiagnostics)> {
     let now = SystemTime::now();
     let stale_cutoff = now
         .checked_sub(stale_threshold)
@@ -236,6 +273,7 @@ pub fn collect_active_sessions_multi(
 
     let mut sessions = Vec::new();
     let mut seen_paths: HashSet<PathBuf> = HashSet::new();
+    let mut diagnostics = SessionCollectionDiagnostics::default();
 
     for sessions_root in sessions_roots {
         if !sessions_root.exists() {
@@ -254,6 +292,7 @@ pub fn collect_active_sessions_multi(
                 continue;
             }
             seen_paths.insert(path.to_path_buf());
+            diagnostics.session_files_seen = diagnostics.session_files_seen.saturating_add(1);
 
             let metadata = match entry.metadata() {
                 Ok(meta) => meta,
@@ -273,8 +312,15 @@ pub fn collect_active_sessions_multi(
             )? {
                 let recency = session_recency(&snapshot, modified);
                 snapshot.last_activity = recency;
-                if should_include_session(&snapshot, recency, stale_cutoff, sticky_cutoff) {
-                    sessions.push(snapshot);
+                match session_inclusion_decision(&snapshot, recency, stale_cutoff, sticky_cutoff) {
+                    SessionInclusionDecision::Include => sessions.push(snapshot),
+                    SessionInclusionDecision::DropStale => {
+                        diagnostics.dropped_stale = diagnostics.dropped_stale.saturating_add(1);
+                    }
+                    SessionInclusionDecision::DropOutsideSticky => {
+                        diagnostics.dropped_outside_sticky =
+                            diagnostics.dropped_outside_sticky.saturating_add(1);
+                    }
                 }
             }
         }
@@ -285,7 +331,7 @@ pub fn collect_active_sessions_multi(
         .retain(|path, _| seen_paths.contains(path));
     sessions = dedupe_sessions_by_id(sessions);
     sessions.sort_by_key(|session| Reverse(session_rank_key(session)));
-    Ok(sessions)
+    Ok((sessions, diagnostics))
 }
 
 fn dedupe_sessions_by_id(sessions: Vec<CodexSessionSnapshot>) -> Vec<CodexSessionSnapshot> {
@@ -309,22 +355,39 @@ fn dedupe_sessions_by_id(sessions: Vec<CodexSessionSnapshot>) -> Vec<CodexSessio
     deduped
 }
 
-pub fn latest_limits_source(sessions: &[CodexSessionSnapshot]) -> Option<&CodexSessionSnapshot> {
-    sessions
-        .iter()
-        .filter(|session| limits_present(&session.limits))
-        .max_by_key(|session| {
-            let observed = session
-                .last_token_event_at
-                .map(|ts| ts.timestamp())
-                .unwrap_or(i64::MIN);
-            let activity = session
-                .last_activity
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            (observed, activity)
-        })
+pub fn latest_limits_source(sessions: &[CodexSessionSnapshot]) -> Option<EffectiveLimitSelection> {
+    let mut candidates: Vec<SessionLimitCandidate> = Vec::new();
+    for session in sessions {
+        if session.rate_limit_envelopes.is_empty() {
+            if telemetry_limits_present(&session.limits) {
+                candidates.push(SessionLimitCandidate {
+                    session_id: session.session_id.clone(),
+                    session_last_activity: session.last_activity,
+                    envelope: RateLimitEnvelope {
+                        limit_id: None,
+                        limit_name: None,
+                        plan_type: None,
+                        observed_at: session.last_token_event_at,
+                        scope: RateLimitScope::Other,
+                        limits: session.limits.clone(),
+                    },
+                });
+            }
+            continue;
+        }
+
+        for envelope in &session.rate_limit_envelopes {
+            if telemetry_limits_present(&envelope.limits) {
+                candidates.push(SessionLimitCandidate {
+                    session_id: session.session_id.clone(),
+                    session_last_activity: session.last_activity,
+                    envelope: envelope.clone(),
+                });
+            }
+        }
+    }
+
+    select_effective_limits_global_first(&candidates)
 }
 
 pub fn preferred_active_session(
@@ -336,25 +399,50 @@ pub fn preferred_active_session(
 }
 
 pub fn limits_present(limits: &RateLimits) -> bool {
-    limits.primary.is_some() || limits.secondary.is_some()
+    telemetry_limits_present(limits)
 }
 
+#[cfg(test)]
 fn should_include_session(
     snapshot: &CodexSessionSnapshot,
     recency: SystemTime,
     stale_cutoff: SystemTime,
     sticky_cutoff: SystemTime,
 ) -> bool {
+    matches!(
+        session_inclusion_decision(snapshot, recency, stale_cutoff, sticky_cutoff),
+        SessionInclusionDecision::Include
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionInclusionDecision {
+    Include,
+    DropStale,
+    DropOutsideSticky,
+}
+
+fn session_inclusion_decision(
+    snapshot: &CodexSessionSnapshot,
+    recency: SystemTime,
+    stale_cutoff: SystemTime,
+    sticky_cutoff: SystemTime,
+) -> SessionInclusionDecision {
     if recency >= stale_cutoff {
-        return true;
+        return SessionInclusionDecision::Include;
     }
     if recency < sticky_cutoff {
-        return false;
+        return SessionInclusionDecision::DropOutsideSticky;
     }
-    snapshot
+    if snapshot
         .activity
         .as_ref()
         .is_some_and(session_activity_is_sticky_active)
+    {
+        SessionInclusionDecision::Include
+    } else {
+        SessionInclusionDecision::DropStale
+    }
 }
 
 fn session_activity_is_sticky_active(activity: &SessionActivitySnapshot) -> bool {
@@ -453,6 +541,8 @@ struct SessionAccumulator {
     session_id: Option<String>,
     cwd: Option<PathBuf>,
     started_at: Option<DateTime<Utc>>,
+    originator: Option<String>,
+    source: Option<String>,
     model: Option<String>,
     approval_policy: Option<String>,
     sandbox_policy: Option<String>,
@@ -467,6 +557,7 @@ struct SessionAccumulator {
     last_output_tokens: Option<u64>,
     model_context_window: Option<u64>,
     limits: RateLimits,
+    rate_limit_envelopes: HashMap<String, RateLimitEnvelope>,
     last_token_event_at: Option<DateTime<Utc>>,
     activity_tracker: ActivityTracker,
 }
@@ -647,18 +738,35 @@ impl ActivityTracker {
 impl SessionAccumulator {
     fn apply_event(&mut self, parsed: &Value) {
         let typ = str_at(parsed, &["type"]);
-        let event_timestamp = str_at(parsed, &["timestamp"]).and_then(parse_utc_timestamp);
         let payload = parsed.get("payload").unwrap_or(&Value::Null);
+        let event_timestamp = str_at(parsed, &["timestamp"])
+            .or_else(|| str_at(payload, &["timestamp"]))
+            .and_then(parse_utc_timestamp);
         self.activity_tracker.observe_timestamp(event_timestamp);
 
         match typ.as_deref() {
             Some("session_meta") => {
-                self.session_id = self.session_id.take().or_else(|| str_at(payload, &["id"]));
-                if self.started_at.is_none() {
-                    self.started_at = str_at(payload, &["timestamp"]).and_then(parse_utc_timestamp);
+                if let Some(incoming_session_id) = str_at(payload, &["id"]) {
+                    let changed_session = self
+                        .session_id
+                        .as_deref()
+                        .is_some_and(|current| current != incoming_session_id.as_str());
+                    if changed_session {
+                        self.reset_for_new_session(incoming_session_id.clone());
+                    } else if self.session_id.is_none() {
+                        self.session_id = Some(incoming_session_id);
+                    }
                 }
+                let session_started = str_at(payload, &["timestamp"]).and_then(parse_utc_timestamp);
+                self.started_at = max_datetime(self.started_at, session_started);
                 if self.cwd.is_none() {
                     self.cwd = str_at(payload, &["cwd"]).map(PathBuf::from);
+                }
+                if self.originator.is_none() {
+                    self.originator = str_at(payload, &["originator"]);
+                }
+                if self.source.is_none() {
+                    self.source = str_at(payload, &["source"]);
                 }
             }
             Some("turn_context") => {
@@ -723,9 +831,20 @@ impl SessionAccumulator {
                         self.model_context_window = Some(context_window);
                     }
 
-                    let parsed_limits = parse_rate_limits(payload.get("rate_limits"));
-                    if limits_present(&parsed_limits) {
-                        self.limits = parsed_limits;
+                    if let Some(parsed_limit) =
+                        parse_rate_limit_envelope(payload.get("rate_limits"), event_timestamp)
+                    {
+                        let key = parsed_limit
+                            .limit_id
+                            .clone()
+                            .unwrap_or_else(|| format!("scope:{}", parsed_limit.scope.as_slug()));
+                        self.rate_limit_envelopes.insert(key, parsed_limit);
+
+                        let envelopes: Vec<RateLimitEnvelope> =
+                            self.rate_limit_envelopes.values().cloned().collect();
+                        if let Some(selected) = select_session_envelope_global_first(&envelopes) {
+                            self.limits = selected.limits;
+                        }
                     }
 
                     if event_timestamp.is_some() {
@@ -802,6 +921,11 @@ impl SessionAccumulator {
         }
     }
 
+    fn reset_for_new_session(&mut self, session_id: String) {
+        *self = SessionAccumulator::default();
+        self.session_id = Some(session_id);
+    }
+
     fn build_snapshot(
         &self,
         jsonl_path: &Path,
@@ -825,7 +949,8 @@ impl SessionAccumulator {
             && self.input_tokens_total == 0
             && self.cached_input_tokens_total == 0
             && self.output_tokens_total == 0
-            && !limits_present(&self.limits)
+            && self.rate_limit_envelopes.is_empty()
+            && !telemetry_limits_present(&self.limits)
             && activity.is_none()
         {
             return None;
@@ -851,6 +976,18 @@ impl SessionAccumulator {
             self.output_tokens_total,
             pricing_config,
         );
+        let mut rate_limit_envelopes: Vec<RateLimitEnvelope> =
+            self.rate_limit_envelopes.values().cloned().collect();
+        rate_limit_envelopes.sort_by_key(|item| {
+            Reverse(
+                item.observed_at
+                    .map(|ts| ts.timestamp_millis())
+                    .unwrap_or(i64::MIN),
+            )
+        });
+        let selected_limits = select_session_envelope_global_first(&rate_limit_envelopes)
+            .map(|selected| selected.limits)
+            .unwrap_or_else(|| self.limits.clone());
         let context_window = build_context_window_snapshot(
             self.model.as_deref(),
             self.model_context_window,
@@ -863,6 +1000,8 @@ impl SessionAccumulator {
             cwd,
             project_name,
             git_branch,
+            originator: self.originator.clone(),
+            source: self.source.clone(),
             model: self.model.clone(),
             approval_policy: self.approval_policy.clone(),
             sandbox_policy: self.sandbox_policy.clone(),
@@ -879,7 +1018,8 @@ impl SessionAccumulator {
             cost_breakdown: cost.breakdown,
             pricing_source: cost.source,
             context_window,
-            limits: self.limits.clone(),
+            limits: selected_limits,
+            rate_limit_envelopes,
             activity,
             started_at: self.started_at,
             last_token_event_at: self.last_token_event_at,
@@ -887,6 +1027,10 @@ impl SessionAccumulator {
             source_file: jsonl_path.to_path_buf(),
         })
     }
+}
+
+fn looks_like_desktop_surface(value: &str) -> bool {
+    value.to_ascii_lowercase().contains("desktop")
 }
 
 fn classify_shell_command(arguments: &str) -> PendingActivity {
@@ -1244,7 +1388,8 @@ fn parse_session_file(
         .with_context(|| format!("failed to open session file {}", jsonl_path.display()))?;
     let mut reader = BufReader::new(file);
     let mut accumulator = SessionAccumulator::default();
-    parse_new_lines(&mut reader, &mut accumulator)?;
+    let mut partial_line_buffer = String::new();
+    parse_new_lines(&mut reader, &mut accumulator, &mut partial_line_buffer)?;
     Ok(accumulator.build_snapshot(jsonl_path, last_activity, git_cache, pricing_config))
 }
 
@@ -1281,7 +1426,11 @@ fn parse_session_file_cached(
     file.seek(SeekFrom::Start(cached.cursor))
         .with_context(|| format!("failed to seek session file {}", jsonl_path.display()))?;
     let mut reader = BufReader::new(file);
-    parse_new_lines(&mut reader, &mut cached.accumulator)?;
+    parse_new_lines(
+        &mut reader,
+        &mut cached.accumulator,
+        &mut cached.partial_line_buffer,
+    )?;
     cached.cursor = reader.stream_position().unwrap_or(file_len);
     cached.file_len = file_len;
     cached.modified = modified;
@@ -1297,6 +1446,7 @@ fn parse_session_file_cached(
 fn parse_new_lines(
     reader: &mut BufReader<File>,
     accumulator: &mut SessionAccumulator,
+    partial_line_buffer: &mut String,
 ) -> Result<()> {
     let mut line = String::new();
     loop {
@@ -1305,15 +1455,28 @@ fn parse_new_lines(
         if bytes == 0 {
             break;
         }
-        let trimmed = line.trim();
+
+        let line_has_terminator = line.ends_with('\n');
+        let combined = if partial_line_buffer.is_empty() {
+            line.to_string()
+        } else {
+            let mut pending = std::mem::take(partial_line_buffer);
+            pending.push_str(&line);
+            pending
+        };
+
+        let trimmed = combined.trim();
         if trimmed.is_empty() {
             continue;
         }
-        let parsed = match serde_json::from_str::<Value>(trimmed) {
-            Ok(value) => value,
+        match serde_json::from_str::<Value>(trimmed) {
+            Ok(parsed) => accumulator.apply_event(&parsed),
+            Err(_) if !line_has_terminator => {
+                partial_line_buffer.push_str(&combined);
+                break;
+            }
             Err(_) => continue,
-        };
-        accumulator.apply_event(&parsed);
+        }
     }
     Ok(())
 }
@@ -1407,37 +1570,6 @@ fn build_context_window_snapshot(
     })
 }
 
-fn parse_rate_limits(value: Option<&Value>) -> RateLimits {
-    let Some(value) = value else {
-        return RateLimits::default();
-    };
-    RateLimits {
-        primary: parse_usage_window(value.get("primary")),
-        secondary: parse_usage_window(value.get("secondary")),
-    }
-}
-
-fn parse_usage_window(value: Option<&Value>) -> Option<UsageWindow> {
-    let value = value?;
-    let used_percent = clamp_percent(float_at(value, &["used_percent"]).unwrap_or(0.0));
-    let remaining_percent = clamp_percent(100.0 - used_percent);
-
-    Some(UsageWindow {
-        used_percent,
-        remaining_percent,
-        window_minutes: uint_at(value, &["window_minutes"]).unwrap_or(0),
-        resets_at: int_at(value, &["resets_at"])
-            .and_then(|epoch| Utc.timestamp_opt(epoch, 0).single()),
-    })
-}
-
-fn clamp_percent(value: f64) -> f64 {
-    if !value.is_finite() {
-        return 0.0;
-    }
-    value.clamp(0.0, 100.0)
-}
-
 fn max_datetime(
     left: Option<DateTime<Utc>>,
     right: Option<DateTime<Utc>>,
@@ -1507,32 +1639,13 @@ fn uint_at(value: &Value, path: &[&str]) -> Option<u64> {
         .or_else(|| cursor.as_i64().and_then(|n| (n >= 0).then_some(n as u64)))
 }
 
-fn int_at(value: &Value, path: &[&str]) -> Option<i64> {
-    let mut cursor = value;
-    for key in path {
-        cursor = cursor.get(*key)?;
-    }
-    cursor
-        .as_i64()
-        .or_else(|| cursor.as_u64().map(|n| n as i64))
-}
-
-fn float_at(value: &Value, path: &[&str]) -> Option<f64> {
-    let mut cursor = value;
-    for key in path {
-        cursor = cursor.get(*key)?;
-    }
-    cursor
-        .as_f64()
-        .or_else(|| cursor.as_u64().map(|n| n as f64))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::PricingConfig;
     use crate::cost::{PricingSource, TokenCostBreakdown};
     use chrono::Duration as ChronoDuration;
+    use chrono::TimeZone;
     use tempfile::TempDir;
 
     fn parse_one(content: &str) -> CodexSessionSnapshot {
@@ -1557,6 +1670,8 @@ mod tests {
             cwd: PathBuf::from("."),
             project_name: "policy-project".to_string(),
             git_branch: None,
+            originator: None,
+            source: None,
             model: None,
             approval_policy: None,
             sandbox_policy: None,
@@ -1574,6 +1689,7 @@ mod tests {
             pricing_source: PricingSource::Fallback,
             context_window: None,
             limits: RateLimits::default(),
+            rate_limit_envelopes: Vec::new(),
             activity: activity_kind.map(|kind| SessionActivitySnapshot {
                 kind,
                 target: None,
@@ -1631,6 +1747,52 @@ mod tests {
         assert_eq!(snapshot.session_total_tokens, None);
         assert_eq!(snapshot.last_turn_tokens, Some(1280));
         assert_eq!(snapshot.session_delta_tokens, Some(1280));
+    }
+
+    #[test]
+    fn session_meta_updates_started_at_when_newer() {
+        let snapshot = parse_one(
+            r#"{"type":"session_meta","payload":{"id":"meta-refresh","timestamp":"2026-02-09T16:30:00Z","cwd":"C:\\repo\\app"}}
+{"type":"session_meta","payload":{"id":"meta-refresh","timestamp":"2026-02-09T16:35:00Z","cwd":"C:\\repo\\app"}}"#,
+        );
+        let expected = parse_utc_timestamp("2026-02-09T16:35:00Z".to_string());
+        assert_eq!(snapshot.started_at, expected);
+    }
+
+    #[test]
+    fn session_meta_parses_desktop_originator() {
+        let snapshot = parse_one(
+            r#"{"type":"session_meta","payload":{"id":"desktop","cwd":"C:\\repo\\app","originator":"Codex Desktop","source":"vscode"}}"#,
+        );
+        assert_eq!(snapshot.originator.as_deref(), Some("Codex Desktop"));
+        assert_eq!(snapshot.source.as_deref(), Some("vscode"));
+        assert!(snapshot.is_desktop_surface());
+    }
+
+    #[test]
+    fn session_meta_ignores_non_string_source_values() {
+        let snapshot = parse_one(
+            r#"{"type":"session_meta","payload":{"id":"subagent","cwd":"C:\\repo\\app","originator":"codex_vscode","source":{"subagent":{"thread_spawn":{"depth":1}}}}}"#,
+        );
+        assert_eq!(snapshot.originator.as_deref(), Some("codex_vscode"));
+        assert_eq!(snapshot.source, None);
+        assert!(!snapshot.is_desktop_surface());
+    }
+
+    #[test]
+    fn session_id_change_resets_accumulator() {
+        let snapshot = parse_one(
+            r#"{"type":"session_meta","payload":{"id":"session-a","timestamp":"2026-02-09T16:30:00Z","cwd":"C:\\repo\\app"}}
+{"timestamp":"2026-02-09T16:31:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":100},"last_token_usage":{"total_tokens":40}}}}
+{"type":"session_meta","payload":{"id":"session-b","timestamp":"2026-02-09T16:40:00Z","cwd":"C:\\repo\\other"}}
+{"timestamp":"2026-02-09T16:41:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":20},"last_token_usage":{"total_tokens":20}}}}"#,
+        );
+        assert_eq!(snapshot.session_id, "session-b");
+        assert_eq!(snapshot.session_total_tokens, Some(20));
+        assert_eq!(snapshot.last_turn_tokens, Some(20));
+        assert_eq!(snapshot.session_delta_tokens, Some(20));
+        let expected = parse_utc_timestamp("2026-02-09T16:40:00Z".to_string());
+        assert_eq!(snapshot.started_at, expected);
     }
 
     #[test]
@@ -1900,6 +2062,8 @@ mod tests {
             cwd: PathBuf::from("."),
             project_name: "older".to_string(),
             git_branch: None,
+            originator: None,
+            source: None,
             model: None,
             approval_policy: None,
             sandbox_policy: None,
@@ -1925,6 +2089,22 @@ mod tests {
                 }),
                 secondary: None,
             },
+            rate_limit_envelopes: vec![RateLimitEnvelope {
+                limit_id: Some("codex".to_string()),
+                limit_name: None,
+                plan_type: None,
+                observed_at: Utc.timestamp_opt(1000, 0).single(),
+                scope: RateLimitScope::GlobalCodex,
+                limits: RateLimits {
+                    primary: Some(UsageWindow {
+                        used_percent: 50.0,
+                        remaining_percent: 50.0,
+                        window_minutes: 300,
+                        resets_at: None,
+                    }),
+                    secondary: None,
+                },
+            }],
             activity: None,
             started_at: None,
             last_token_event_at: Utc.timestamp_opt(1000, 0).single(),
@@ -1936,6 +2116,8 @@ mod tests {
             cwd: PathBuf::from("."),
             project_name: "newer".to_string(),
             git_branch: None,
+            originator: None,
+            source: None,
             model: None,
             approval_policy: None,
             sandbox_policy: None,
@@ -1961,6 +2143,22 @@ mod tests {
                 }),
                 secondary: None,
             },
+            rate_limit_envelopes: vec![RateLimitEnvelope {
+                limit_id: Some("codex".to_string()),
+                limit_name: None,
+                plan_type: None,
+                observed_at: Utc.timestamp_opt(2000, 0).single(),
+                scope: RateLimitScope::GlobalCodex,
+                limits: RateLimits {
+                    primary: Some(UsageWindow {
+                        used_percent: 20.0,
+                        remaining_percent: 80.0,
+                        window_minutes: 300,
+                        resets_at: None,
+                    }),
+                    secondary: None,
+                },
+            }],
             activity: None,
             started_at: None,
             last_token_event_at: Utc.timestamp_opt(2000, 0).single(),
@@ -1970,7 +2168,7 @@ mod tests {
 
         let sessions = vec![older, newer];
         let source = latest_limits_source(&sessions).expect("limits source");
-        assert_eq!(source.session_id, "newer");
+        assert_eq!(source.source_session_id, "newer");
     }
 
     #[test]
@@ -2198,6 +2396,104 @@ mod tests {
         let observed = activity.observed_at.expect("observed_at");
         let drift = observed.signed_duration_since(old).num_milliseconds().abs();
         assert!(drift <= 1000, "observed_at drifted by {drift}ms");
+    }
+
+    #[test]
+    fn parser_keeps_partial_json_until_completed() {
+        let tmp = TempDir::new().expect("temp dir");
+        let file_path = tmp.path().join("partial.jsonl");
+        let full_event_line = r#"{"timestamp":"2026-02-09T16:35:13Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":210},"last_token_usage":{"total_tokens":80}}}}"#;
+        let split_at = full_event_line.len().saturating_sub(8);
+        let (event_head, _event_tail) = full_event_line.split_at(split_at);
+        std::fs::write(
+            &file_path,
+            format!(
+                "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"partial\",\"cwd\":\"C:\\\\repo\\\\app\"}}}}\n{}",
+                event_head
+            ),
+        )
+        .expect("write");
+
+        let file = File::open(&file_path).expect("open");
+        let mut reader = BufReader::new(file);
+        let mut accumulator = SessionAccumulator::default();
+        let mut partial_line_buffer = String::new();
+        parse_new_lines(&mut reader, &mut accumulator, &mut partial_line_buffer).expect("parse");
+
+        assert!(
+            !partial_line_buffer.is_empty(),
+            "partial json line should be retained"
+        );
+        assert_eq!(accumulator.session_total_tokens, None);
+    }
+
+    #[test]
+    fn cached_parser_does_not_drop_split_line() {
+        let tmp = TempDir::new().expect("temp dir");
+        let file_path = tmp.path().join("split.jsonl");
+        let full_event_line = r#"{"timestamp":"2026-02-09T16:35:13Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":210},"last_token_usage":{"total_tokens":80}}}}"#;
+        let split_at = full_event_line.len().saturating_sub(8);
+        let (event_head, event_tail) = full_event_line.split_at(split_at);
+        std::fs::write(
+            &file_path,
+            format!(
+                "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"split\",\"cwd\":\"C:\\\\repo\\\\app\"}}}}\n{}",
+                event_head
+            ),
+        )
+        .expect("write initial");
+
+        let mut git_cache = GitBranchCache::new(Duration::from_secs(30));
+        let mut parse_cache = SessionParseCache::default();
+        let meta1 = std::fs::metadata(&file_path).expect("meta1");
+        let modified1 = meta1.modified().expect("modified1");
+
+        let snapshot1 = parse_session_file_cached(
+            &file_path,
+            &meta1,
+            modified1,
+            &mut git_cache,
+            &mut parse_cache,
+            &PricingConfig::default(),
+        )
+        .expect("parse1")
+        .expect("snapshot1");
+        assert_eq!(snapshot1.session_total_tokens, None);
+        assert!(
+            !parse_cache
+                .entries
+                .get(&file_path)
+                .expect("cache1")
+                .partial_line_buffer
+                .is_empty()
+        );
+
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&file_path)
+            .expect("append open");
+        use std::io::Write as _;
+        writeln!(file, "{}", event_tail).expect("append tail");
+        file.flush().expect("flush tail");
+        drop(file);
+
+        let meta2 = std::fs::metadata(&file_path).expect("meta2");
+        let modified2 = meta2.modified().expect("modified2");
+        let snapshot2 = parse_session_file_cached(
+            &file_path,
+            &meta2,
+            modified2,
+            &mut git_cache,
+            &mut parse_cache,
+            &PricingConfig::default(),
+        )
+        .expect("parse2")
+        .expect("snapshot2");
+        let cache2 = parse_cache.entries.get(&file_path).expect("cache2");
+
+        assert_eq!(snapshot2.session_total_tokens, Some(210));
+        assert_eq!(snapshot2.last_turn_tokens, Some(80));
+        assert!(cache2.partial_line_buffer.is_empty());
     }
 
     #[test]

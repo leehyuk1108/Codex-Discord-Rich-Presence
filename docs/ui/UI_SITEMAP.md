@@ -5,13 +5,13 @@
 Render pipeline is responsive by mode:
 
 - `Full` (wide/tall): full OpenAI + CODEX banner, richer runtime/active context.
-- `Compact` (medium): CODEX-first banner fallback and condensed metadata.
+- `Compact` (medium): CODEX-first fallback and condensed metadata.
 - `Minimal` (small): essentials only with compact banner fallback.
 
 Banner selection is now independent from data-density mode and uses this deterministic ladder:
 
 1. `Image` (only when eligible and enough rows exist for image + subtitle lines)
-2. `ASCII Dual` (OpenAI + CODEX, full mode only)
+2. `ASCII Dual` (OpenAI + CODEX, when width/rows allow)
 3. `ASCII CODEX` (preferred medium/small fallback)
 4. `Compact text` (2 lines)
 5. `Minimal text` (1 line)
@@ -34,7 +34,7 @@ This keeps `Recent Sessions` visible by default while allowing an explicit extre
 
 1. Banner
 - Hybrid behavior:
-  - inline image when terminal supports it and config allows it.
+  - inline image when explicitly configured (`display.terminal_logo_mode = "image"` and path available).
   - deterministic ASCII fallback otherwise, with CODEX-only intermediate step.
 - High-legibility `CODEX` wordmark, centered subtitle, and no partial ASCII clipping.
 
@@ -44,11 +44,16 @@ This keeps `Recent Sessions` visible by default while allowing an explicit extre
 
 3. Active Session
 - Project, activity, model + OpenAI plan tier, context window (`used/total` + `% left`).
+- Plan trace row (`Plan: <tier> (auto)`).
+- Limits trace rows:
+  - `Limits Src: <limit_id> (<scope>)`
+  - `Updated: <age>`
 - Model label uses display formatting (`GPT-5.3-Codex`, `GPT-5.1-Codex-Mini`) instead of raw lowercase ids.
 - Context `used` value is sourced from active-turn usage (`last_token_usage`) to avoid cumulative-session inflation.
 - Token triplet (`This update | Last response | Session total`) in full/compact modes.
 - Cost line + branch (path in full mode).
 - Remaining limit bars (`5h`, `7d`) with semantic color.
+- Spark guardrail warning in TUI when telemetry shows Spark with non-Pro plan.
 
 4. Metrics
 - Always rendered after active session.
@@ -91,7 +96,15 @@ This keeps `Recent Sessions` visible by default while allowing an explicit extre
   4. deterministic `session_id` tiebreak.
 - Sticky session extension applies to working activity kinds and `Waiting for input`.
 
-## 5. Visual Constraints
+## 5. Surface-Aware Branding
+
+- Surface detection comes from `session_meta.originator` and `session_meta.source`.
+- Default surface is CLI/VS Code.
+- Desktop surface switches to Codex App branding automatically.
+- Discord app/client selection is dynamic per surface (no manual toggle required while running).
+- Idle presence keeps the last active surface so the card does not jump between app identities.
+
+## 6. Visual Constraints
 
 - No line overflow by width truncation.
 - Footer remains anchored on terminal resize.

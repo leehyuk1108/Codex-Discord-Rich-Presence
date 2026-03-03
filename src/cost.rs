@@ -176,8 +176,11 @@ fn fallback_pricing() -> ModelPricing {
 
 fn default_alias_target(model: &str) -> Option<&'static str> {
     match model {
-        // User-approved policy: gpt-5.3-codex inherits gpt-5.2-codex pricing.
-        "gpt-5.3-codex" | "gpt-5.3-codex-latest" => Some("gpt-5.2-codex"),
+        // User-approved policy: gpt-5.3 Codex variants inherit gpt-5.2-codex pricing.
+        "gpt-5.3-codex"
+        | "gpt-5.3-codex-latest"
+        | "gpt-5.3-codex-spark"
+        | "gpt-5.3-codex-spark-latest" => Some("gpt-5.2-codex"),
         _ => None,
     }
 }
@@ -241,6 +244,16 @@ mod tests {
     fn aliases_gpt_5_3_codex_to_gpt_5_2_codex() {
         let config = PricingConfig::default();
         let resolved = resolve_model_pricing("gpt-5.3-codex", &config);
+        assert_eq!(resolved.source, PricingSource::Alias);
+        assert_eq!(resolved.resolved_model, "gpt-5.2-codex");
+        assert!((resolved.pricing.input_per_million - 1.75).abs() < 0.0001);
+        assert!((resolved.pricing.output_per_million - 14.0).abs() < 0.0001);
+    }
+
+    #[test]
+    fn aliases_gpt_5_3_codex_spark_to_gpt_5_2_codex() {
+        let config = PricingConfig::default();
+        let resolved = resolve_model_pricing("gpt-5.3-codex-spark", &config);
         assert_eq!(resolved.source, PricingSource::Alias);
         assert_eq!(resolved.resolved_model, "gpt-5.2-codex");
         assert!((resolved.pricing.input_per_million - 1.75).abs() < 0.0001);

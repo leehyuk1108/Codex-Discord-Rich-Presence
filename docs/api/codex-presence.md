@@ -1,4 +1,4 @@
-# codex-discord-presence CLI Contract
+# Codex Discord Rich Presence CLI Contract
 
 ## Binary
 
@@ -47,6 +47,7 @@ Outputs:
 - discovered session roots,
 - active session count,
 - ranked active session summary,
+- selected limits source details (`limit_id`, scope, freshness),
 - token/cost breakdown and remaining limits.
 
 ### 4) Doctor
@@ -62,9 +63,12 @@ codex-discord-presence doctor
 
 All generated build and release outputs are written under `releases/`:
 
-- Windows executable output: `releases/windows/codex-discord-presence.exe`
-- Fallback when locked: `releases/windows/codex-discord-presence.next.exe`
-- Windows convenience build also cleans legacy artifact folders such as `dist/`, `releases/.cargo-target`, and `releases/windows/x64/`.
+- Windows executable output: `releases/windows/codex-discord-rich-presence.exe`
+- Linux executable output: `releases/linux/codex-discord-rich-presence`
+- macOS executable output: `releases/macos/codex-discord-rich-presence`
+- Release packaging scripts:
+  - `scripts/build-release.ps1` (Windows)
+  - `scripts/build-release.sh` (Linux/macOS)
 
 ## Session Selection Contract
 
@@ -79,6 +83,14 @@ When multiple sessions exist, active-session selection is deterministic:
 4. stable `session_id` tiebreak.
 
 This ranking is used for both TUI primary card and Discord presence source.
+
+## Limits Selection Contract
+
+- Effective 5h/7d selection is `global codex-first`:
+  1. Prefer newest valid envelope with `rate_limits.limit_id = "codex"`.
+  2. Fallback to newest valid non-`codex` envelope (`codex_*` or other) only if global is missing.
+- Parser retains multiple envelopes per session to avoid losing global data when events alternate (`codex` + `codex_*`).
+- Status/TUI expose selected source as `<limit_id> (<scope>)` + freshness (`Updated: <age>`).
 
 ## Activity Interpretation Contract
 
@@ -97,6 +109,15 @@ This ranking is used for both TUI primary card and Discord presence source.
   - working activity kinds
   - `Waiting for input`.
 
+## Surface Detection Contract
+
+- Runtime surface is auto-detected from `session_meta`:
+  - `originator` containing `desktop` => Desktop surface.
+  - fallback: string `source` containing `desktop` => Desktop surface.
+  - otherwise => default CLI/VS Code surface.
+- Non-string `source` payloads (for example subagent metadata objects) are ignored for surface detection.
+- Idle surface sticks to the latest detected active surface, so the idle card remains consistent.
+
 ## Discord Presence Payload Contract
 
 When privacy mode is disabled:
@@ -106,8 +127,9 @@ When privacy mode is disabled:
     - `Reading app.rs - MCP Servers`
     - `Thinking - Property Alpha (tony/mobile1)`
 - `state`: prioritized compact telemetry
-  - `<model> | <plan> • $cost • N tokens • Ctx U/T used (L% left) • 5h A% • 7d B%`
+  - `<model> | <plan> • $cost • N tok • Ctx L% • 5h A% • 7d B%`
   - model ids are display-formatted (for example `GPT-5.3-Codex`).
+  - plan label is auto-detected from telemetry (`rate_limits.plan_type`) with cache fallback.
   - truncation policy drops lower-priority tail fields first.
   - model + plan and cost remain pinned whenever present.
   - bounded to Discord field limits (2..128 chars).
@@ -123,13 +145,15 @@ Update behavior:
 - rate-limits publish bursts via minimum interval.
 - sends heartbeat re-publish every `30s` even when payload is unchanged.
 - reconnects IPC with exponential backoff (`5s` to `60s`) when Discord is unavailable.
-- keeps an explicit idle card (`Codex CLI` / `Waiting for session`) instead of clearing activity.
+- keeps an explicit idle card (`Codex CLI/VS Code` or `Codex App` / `Waiting for session`) instead of clearing activity.
+- can switch Discord application/client dynamically when surface changes (CLI/VS Code <-> Desktop).
 - validates configured image keys against Discord app assets when available.
 - skips invalid image keys and falls back to safe icon payload (avoids `?` placeholder on Discord mobile).
 
 ## Environment Variables
 
 - `CODEX_DISCORD_CLIENT_ID`
+- `CODEX_DISCORD_CLIENT_ID_DESKTOP`
 - `CODEX_PRESENCE_STALE_SECONDS`
 - `CODEX_PRESENCE_POLL_SECONDS`
 - `CODEX_PRESENCE_ACTIVE_STICKY_SECONDS`
@@ -139,13 +163,16 @@ Update behavior:
 ## Local Config Contract
 
 - Path: `~/.codex/discord-presence-config.json`
-- Schema: `5`
+- Schema: `7`
 - Key fields:
   - `discord_client_id`
+  - `discord_client_id_desktop`
   - `discord_public_key` (metadata)
   - `privacy.*`
     - includes `show_cost`
   - `display.large_image_key`
+  - `display.desktop_large_image_key`
+  - `display.desktop_large_text`
   - `display.small_image_key`
   - `display.activity_small_image_keys` (optional per-activity small image keys)
     - `thinking`, `reading`, `editing`, `running`, `waiting`, `idle`
@@ -156,8 +183,21 @@ Update behavior:
   - `display.terminal_logo_path`
   - `pricing.aliases` (model-id alias map)
   - `pricing.overrides` (per-model `input_per_million`, `cached_input_per_million`, `output_per_million`)
-  - `openai_plan.tier` (`free`, `go`, `plus`, `pro`)
-  - `openai_plan.show_price`
+  - `openai_plan.tier` (legacy/deprecated at runtime)
+  - `openai_plan.show_price` (applies to auto-detected plan label)
+
+## Plan Detection Contract
+
+- Runtime plan source priority:
+  1. latest non-null `rate_limits.plan_type` (prefer global `limit_id=codex` signal),
+  2. in-memory last known telemetry value,
+  3. persisted cache `~/.codex/discord-presence-plan-cache.json`,
+  4. fallback `Unknown`.
+- Supported mapped tiers:
+  - `free`, `go`, `plus`, `business`, `enterprise`, `pro`, `unknown`.
+- Spark policy:
+  - `gpt-5.3-codex-spark` is treated as Pro-only for diagnostics.
+  - non-Pro + Spark is flagged as telemetry anomaly in TUI (no crash; Discord remains compact).
 
 ## Context Window Contract
 

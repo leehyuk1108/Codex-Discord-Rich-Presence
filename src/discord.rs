@@ -4,17 +4,19 @@ use discord_rich_presence::activity::{Activity, Assets, Timestamps};
 use discord_rich_presence::{DiscordIpc, DiscordIpcClient};
 use serde::Deserialize;
 use std::collections::HashSet;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
-use crate::config::PresenceConfig;
+use crate::config::{PresenceConfig, PresenceSurface};
 use crate::session::{CodexSessionSnapshot, RateLimits, SessionActivityKind};
+use crate::telemetry::plan::ResolvedPlan;
 use crate::util::{format_cost, format_model_name, format_tokens};
 
 pub struct DiscordPresence {
+    surface: PresenceSurface,
     client_id: Option<String>,
     client: Option<DiscordIpcClient>,
     last_status: String,
-    last_sent: Option<(String, String)>,
+    last_sent: Option<PresencePayload>,
     last_publish_at: Option<Instant>,
     known_asset_keys: Option<HashSet<String>>,
     last_asset_refresh_at: Option<Instant>,
@@ -32,14 +34,20 @@ const DISCORD_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 const RECONNECT_MIN_BACKOFF: Duration = Duration::from_secs(5);
 const RECONNECT_MAX_BACKOFF: Duration = Duration::from_secs(60);
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PresencePayload {
+    session_id: Option<String>,
+    start_epoch: i64,
+    details: String,
+    state: String,
+}
+
 impl DiscordPresence {
     pub fn new(client_id: Option<String>) -> Self {
-        let last_status = if client_id.is_some() {
-            "Disconnected".to_string()
-        } else {
-            "Missing CODEX_DISCORD_CLIENT_ID".to_string()
-        };
+        let surface = PresenceSurface::Default;
+        let last_status = status_for_client_id(surface, client_id.as_deref());
         Self {
+            surface,
             client_id,
             client: None,
             last_status,
@@ -63,10 +71,15 @@ impl DiscordPresence {
         &mut self,
         active_session: Option<&CodexSessionSnapshot>,
         effective_limits: Option<&RateLimits>,
+        resolved_plan: &ResolvedPlan,
         config: &PresenceConfig,
     ) -> Result<()> {
+        self.surface = detect_surface(active_session).unwrap_or(self.surface);
+        let desired_client_id = config.effective_client_id_for_surface(self.surface);
+        self.switch_client_if_needed(desired_client_id);
+
         if self.client_id.is_none() {
-            self.last_status = "Missing CODEX_DISCORD_CLIENT_ID".to_string();
+            self.last_status = status_for_client_id(self.surface, None);
             return Ok(());
         }
 
@@ -86,10 +99,18 @@ impl DiscordPresence {
         match active_session {
             Some(session) => {
                 self.idle_start_epoch = None;
-                let (details, state) = presence_lines(session, effective_limits, config);
-                let payload = (details.clone(), state.clone());
+                let (details, state) =
+                    presence_lines(session, effective_limits, resolved_plan, config);
+                let start_epoch = presence_start_epoch(session);
+                let payload = PresencePayload {
+                    session_id: Some(session.session_id.clone()),
+                    start_epoch,
+                    details: details.clone(),
+                    state: state.clone(),
+                };
+                let payload_changed = self.last_sent.as_ref() != Some(&payload);
 
-                if self.last_sent.as_ref() == Some(&payload) && !needs_heartbeat {
+                if should_skip_publish(&self.last_sent, &payload, needs_heartbeat) {
                     self.last_status = "Connected".to_string();
                     return Ok(());
                 }
@@ -101,21 +122,26 @@ impl DiscordPresence {
                 }
 
                 let (small_image_key, small_text) = small_asset_for_activity(session, config);
-                let resolved_large_key = resolve_image_key(
-                    &config.display.large_image_key,
-                    self.known_asset_keys.as_ref(),
-                );
+                let branding = display_branding(self.surface, config);
+                let resolved_large_key =
+                    resolve_image_key(branding.large_image_key, self.known_asset_keys.as_ref());
                 let resolved_small_key =
                     resolve_image_key(&small_image_key, self.known_asset_keys.as_ref());
                 let (large_image_key, small_image_key) =
                     normalize_asset_pair(resolved_large_key, resolved_small_key);
 
+                // Discord can occasionally keep stale data for same app/client.
+                // Clearing before a changed payload forces a hard refresh.
+                if payload_changed && let Some(client) = self.client.as_mut() {
+                    let _ = client.clear_activity();
+                }
+
                 let activity = build_activity(
                     &details,
                     &state,
-                    session,
+                    start_epoch,
                     large_image_key.as_deref(),
-                    non_empty_trimmed(&config.display.large_text),
+                    non_empty_trimmed(branding.large_text),
                     small_image_key.as_deref(),
                     non_empty_trimmed(&small_text),
                 );
@@ -137,15 +163,20 @@ impl DiscordPresence {
                 self.last_status = "Connected".to_string();
             }
             None => {
-                let idle_start = *self
-                    .idle_start_epoch
-                    .get_or_insert_with(|| Utc::now().timestamp().max(0));
+                let idle_start = idle_start_epoch(&mut self.idle_start_epoch);
+                let branding = display_branding(self.surface, config);
 
-                let details = "Codex CLI".to_string();
+                let details = branding.idle_details.to_string();
                 let state = "Waiting for session".to_string();
-                let payload = (details.clone(), state.clone());
+                let payload = PresencePayload {
+                    session_id: None,
+                    start_epoch: idle_start,
+                    details: details.clone(),
+                    state: state.clone(),
+                };
+                let payload_changed = self.last_sent.as_ref() != Some(&payload);
 
-                if self.last_sent.as_ref() == Some(&payload) && !needs_heartbeat {
+                if should_skip_publish(&self.last_sent, &payload, needs_heartbeat) {
                     self.last_status = "Connected (idle)".to_string();
                     return Ok(());
                 }
@@ -156,10 +187,11 @@ impl DiscordPresence {
                     return Ok(());
                 }
 
-                let resolved_large_key = resolve_image_key(
-                    &config.display.large_image_key,
-                    self.known_asset_keys.as_ref(),
-                );
+                let resolved_large_key =
+                    resolve_image_key(branding.large_image_key, self.known_asset_keys.as_ref());
+                if payload_changed && let Some(client) = self.client.as_mut() {
+                    let _ = client.clear_activity();
+                }
 
                 let mut activity = Activity::new()
                     .details(&details)
@@ -168,7 +200,7 @@ impl DiscordPresence {
 
                 if let Some(large_key) = resolved_large_key.as_deref() {
                     let mut assets = Assets::new().large_image(large_key);
-                    if let Some(text) = non_empty_trimmed(&config.display.large_text) {
+                    if let Some(text) = non_empty_trimmed(branding.large_text) {
                         assets = assets.large_text(text);
                     }
                     activity = activity.assets(assets);
@@ -208,10 +240,9 @@ impl DiscordPresence {
         self.last_asset_refresh_at = None;
         self.idle_start_epoch = None;
         self.reconnect_backoff = RECONNECT_MIN_BACKOFF;
+        self.last_reconnect_attempt = None;
         self.consecutive_errors = 0;
-        if self.client_id.is_some() {
-            self.last_status = "Disconnected".to_string();
-        }
+        self.last_status = status_for_client_id(self.surface, self.client_id.as_deref());
     }
 
     fn clear_activity(&mut self) -> Result<()> {
@@ -294,6 +325,74 @@ impl DiscordPresence {
             .saturating_mul(1u64 << self.consecutive_errors.min(4));
         self.reconnect_backoff = Duration::from_secs(secs.min(RECONNECT_MAX_BACKOFF.as_secs()));
     }
+
+    fn switch_client_if_needed(&mut self, next_client_id: Option<String>) {
+        if self.client_id == next_client_id {
+            return;
+        }
+
+        if let Some(client) = self.client.as_mut() {
+            let _ = client.clear_activity();
+            let _ = client.close();
+        }
+        self.client = None;
+        self.client_id = next_client_id;
+        self.last_sent = None;
+        self.last_publish_at = None;
+        self.last_heartbeat_at = None;
+        self.known_asset_keys = None;
+        self.last_asset_refresh_at = None;
+        self.last_reconnect_attempt = None;
+        self.reconnect_backoff = RECONNECT_MIN_BACKOFF;
+        self.consecutive_errors = 0;
+        self.idle_start_epoch = None;
+        self.last_status = status_for_client_id(self.surface, self.client_id.as_deref());
+    }
+}
+
+#[derive(Clone, Copy)]
+struct SurfaceDisplay<'a> {
+    large_image_key: &'a str,
+    large_text: &'a str,
+    idle_details: &'a str,
+}
+
+fn detect_surface(active_session: Option<&CodexSessionSnapshot>) -> Option<PresenceSurface> {
+    active_session.map(|session| {
+        if session.is_desktop_surface() {
+            PresenceSurface::Desktop
+        } else {
+            PresenceSurface::Default
+        }
+    })
+}
+
+fn display_branding<'a>(
+    surface: PresenceSurface,
+    config: &'a PresenceConfig,
+) -> SurfaceDisplay<'a> {
+    match surface {
+        PresenceSurface::Default => SurfaceDisplay {
+            large_image_key: &config.display.large_image_key,
+            large_text: &config.display.large_text,
+            idle_details: "Codex CLI/VS Code",
+        },
+        PresenceSurface::Desktop => SurfaceDisplay {
+            large_image_key: &config.display.desktop_large_image_key,
+            large_text: &config.display.desktop_large_text,
+            idle_details: "Codex App",
+        },
+    }
+}
+
+fn status_for_client_id(surface: PresenceSurface, client_id: Option<&str>) -> String {
+    if client_id.is_some() {
+        "Disconnected".to_string()
+    } else if matches!(surface, PresenceSurface::Desktop) {
+        "Missing desktop Discord client id".to_string()
+    } else {
+        "Missing CODEX_DISCORD_CLIENT_ID".to_string()
+    }
 }
 
 fn compact_error(input: &str) -> String {
@@ -303,22 +402,16 @@ fn compact_error(input: &str) -> String {
 fn build_activity<'a>(
     details: &'a str,
     state: &'a str,
-    session: &'a CodexSessionSnapshot,
+    start_epoch: i64,
     large_image_key: Option<&'a str>,
     large_text: Option<&'a str>,
     small_image_key: Option<&'a str>,
     small_text: Option<&'a str>,
 ) -> Activity<'a> {
-    let start = session
-        .started_at
-        .unwrap_or_else(Utc::now)
-        .timestamp()
-        .max(0);
-
     let mut activity = Activity::new()
         .details(details)
         .state(state)
-        .timestamps(Timestamps::new().start(start));
+        .timestamps(Timestamps::new().start(start_epoch));
 
     let mut assets = Assets::new();
     let mut has_assets = false;
@@ -346,9 +439,33 @@ fn build_activity<'a>(
     activity
 }
 
+fn should_skip_publish(
+    previous: &Option<PresencePayload>,
+    payload: &PresencePayload,
+    needs_heartbeat: bool,
+) -> bool {
+    !needs_heartbeat && previous.as_ref() == Some(payload)
+}
+
+fn idle_start_epoch(idle_start_epoch: &mut Option<i64>) -> i64 {
+    *idle_start_epoch.get_or_insert_with(|| Utc::now().timestamp().max(0))
+}
+
+fn presence_start_epoch(session: &CodexSessionSnapshot) -> i64 {
+    system_time_to_epoch(session.last_activity)
+        .or_else(|| session.started_at.map(|value| value.timestamp().max(0)))
+        .unwrap_or_else(|| Utc::now().timestamp().max(0))
+}
+
+fn system_time_to_epoch(value: SystemTime) -> Option<i64> {
+    let duration = value.duration_since(SystemTime::UNIX_EPOCH).ok()?;
+    i64::try_from(duration.as_secs()).ok()
+}
+
 fn presence_lines(
     session: &CodexSessionSnapshot,
     effective_limits: Option<&RateLimits>,
+    resolved_plan: &ResolvedPlan,
     config: &PresenceConfig,
 ) -> (String, String) {
     if config.privacy.enabled {
@@ -377,14 +494,14 @@ fn presence_lines(
                 project_label
             )
         } else if config.privacy.show_project_name {
-            format!("Working on {}", project_label)
+            format!("In {}", project_label)
         } else {
-            "Working in Codex".to_string()
+            "Coding session".to_string()
         }
     } else if config.privacy.show_project_name {
-        format!("Working on {}", project_label)
+        format!("In {}", project_label)
     } else {
-        "Working in Codex".to_string()
+        "Coding session".to_string()
     };
 
     let limits = effective_limits.unwrap_or(&session.limits);
@@ -396,28 +513,20 @@ fn presence_lines(
         let label = format!(
             "{} | {}",
             format_model_name(model),
-            config.openai_plan.label()
+            resolved_plan.label(config.openai_plan.show_price)
         );
-        state_parts.push(truncate_for_limit(&label, 72));
+        state_parts.push(truncate_for_limit(&label, 68));
     }
     if config.privacy.show_cost && session.total_cost_usd > 0.0 {
         state_parts.push(format_cost(session.total_cost_usd));
     }
-    if config.privacy.show_tokens
-        && let Some(tokens) = token_state_part(session)
+    if let Some(usage) = usage_state_part(session, config.privacy.show_tokens) {
+        state_parts.push(usage);
+    }
+    if config.privacy.show_limits
+        && let Some(limits_part) = limits_state_part(limits)
     {
-        state_parts.push(tokens);
-    }
-    if let Some(context) = context_state_part(session) {
-        state_parts.push(context);
-    }
-    if config.privacy.show_limits {
-        if let Some(primary) = &limits.primary {
-            state_parts.push(format!("5h {:.0}%", primary.remaining_percent));
-        }
-        if let Some(secondary) = &limits.secondary {
-            state_parts.push(format!("7d {:.0}%", secondary.remaining_percent));
-        }
+        state_parts.push(limits_part);
     }
 
     let fallback = if config.privacy.show_project_name {
@@ -433,7 +542,7 @@ fn token_state_part(session: &CodexSessionSnapshot) -> Option<String> {
     if let Some(total) = session.session_total_tokens
         && total > 0
     {
-        return Some(format!("{} tokens", format_tokens(total)));
+        return Some(format!("{} tok", format_tokens(total)));
     }
     if let Some(last) = session.last_turn_tokens
         && last > 0
@@ -443,19 +552,44 @@ fn token_state_part(session: &CodexSessionSnapshot) -> Option<String> {
     if let Some(delta) = session.session_delta_tokens
         && delta > 0
     {
-        return Some(format!("Update {}", format_tokens(delta)));
+        return Some(format!("+{}", format_tokens(delta)));
     }
     None
 }
 
 fn context_state_part(session: &CodexSessionSnapshot) -> Option<String> {
     let context = session.context_window.as_ref()?;
-    Some(format!(
-        "Ctx {}/{} used ({:.0}% left)",
-        format_tokens(context.used_tokens),
-        format_tokens(context.window_tokens),
-        context.remaining_percent
-    ))
+    Some(format!("Ctx {:.0}%", context.remaining_percent))
+}
+
+fn usage_state_part(session: &CodexSessionSnapshot, show_tokens: bool) -> Option<String> {
+    let mut parts = Vec::new();
+    if show_tokens && let Some(tokens) = token_state_part(session) {
+        parts.push(tokens);
+    }
+    if let Some(context) = context_state_part(session) {
+        parts.push(context);
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(" • "))
+    }
+}
+
+fn limits_state_part(limits: &RateLimits) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(primary) = &limits.primary {
+        parts.push(format!("5h {:.0}%", primary.remaining_percent));
+    }
+    if let Some(secondary) = &limits.secondary {
+        parts.push(format!("7d {:.0}%", secondary.remaining_percent));
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(" • "))
+    }
 }
 
 fn small_asset_for_activity(
@@ -613,11 +747,22 @@ fn truncate_for_limit(input: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{OpenAiPlanTier, PresenceConfig};
+    use crate::config::PresenceConfig;
     use crate::cost::{PricingSource, TokenCostBreakdown};
     use crate::session::{ContextWindowSnapshot, ContextWindowSource, RateLimits, UsageWindow};
+    use crate::telemetry::plan::{DetectedPlanSource, DetectedPlanTier, ResolvedPlan};
+    use chrono::TimeZone;
     use std::path::PathBuf;
-    use std::time::SystemTime;
+    use std::time::{Duration, SystemTime};
+
+    fn resolved_plan_pro() -> ResolvedPlan {
+        ResolvedPlan {
+            tier: DetectedPlanTier::Pro,
+            source: DetectedPlanSource::Telemetry,
+            observed_at: None,
+            raw_plan_type: Some("pro".to_string()),
+        }
+    }
 
     fn sample_session() -> CodexSessionSnapshot {
         CodexSessionSnapshot {
@@ -625,6 +770,8 @@ mod tests {
             cwd: PathBuf::from("."),
             project_name: "project-alpha".to_string(),
             git_branch: Some("feature/main".to_string()),
+            originator: None,
+            source: None,
             model: Some("gpt-5.3-codex".to_string()),
             approval_policy: None,
             sandbox_policy: None,
@@ -665,6 +812,7 @@ mod tests {
                     resets_at: None,
                 }),
             },
+            rate_limit_envelopes: Vec::new(),
             started_at: None,
             last_token_event_at: None,
             activity: None,
@@ -674,14 +822,52 @@ mod tests {
     }
 
     #[test]
+    fn active_presence_uses_recent_activity_epoch() {
+        let mut session = sample_session();
+        session.started_at = Utc.timestamp_opt(100, 0).single();
+        session.last_activity = SystemTime::UNIX_EPOCH + Duration::from_secs(400);
+        assert_eq!(presence_start_epoch(&session), 400);
+    }
+
+    #[test]
+    fn update_publishes_when_start_epoch_changes_even_if_text_same() {
+        let old_payload = PresencePayload {
+            session_id: Some("session-1".to_string()),
+            start_epoch: 100,
+            details: "Editing src/main.rs".to_string(),
+            state: "GPT-5.3-Codex".to_string(),
+        };
+        let new_payload = PresencePayload {
+            session_id: Some("session-1".to_string()),
+            start_epoch: 120,
+            details: "Editing src/main.rs".to_string(),
+            state: "GPT-5.3-Codex".to_string(),
+        };
+        assert!(!should_skip_publish(
+            &Some(old_payload),
+            &new_payload,
+            false
+        ));
+    }
+
+    #[test]
+    fn idle_presence_keeps_idle_start_behavior() {
+        let mut idle = None;
+        let first = idle_start_epoch(&mut idle);
+        let second = idle_start_epoch(&mut idle);
+        assert_eq!(first, second);
+    }
+
+    #[test]
     fn state_uses_remaining_limits_and_cost_tokens() {
         let session = sample_session();
         let config = PresenceConfig::default();
-        let (_details, state) = presence_lines(&session, Some(&session.limits), &config);
+        let plan = resolved_plan_pro();
+        let (_details, state) = presence_lines(&session, Some(&session.limits), &plan, &config);
         assert!(state.contains("GPT-5.3-Codex | Pro ($200/month)"));
         assert!(state.contains(format_cost(session.total_cost_usd).as_str()));
-        assert!(state.contains("30.0K tokens"));
-        assert!(state.contains("Ctx 15.7K/258.4K used (94% left)"));
+        assert!(state.contains("30.0K tok"));
+        assert!(state.contains("Ctx 94%"));
         assert!(state.contains("5h 64%"));
         assert!(state.contains("7d 18%"));
     }
@@ -690,9 +876,9 @@ mod tests {
     fn state_keeps_priority_when_length_is_limited() {
         let mut session = sample_session();
         session.model = Some("gpt-5.3-codex-ultra-long-variant-name-for-tests".to_string());
-        let mut config = PresenceConfig::default();
-        config.openai_plan.tier = OpenAiPlanTier::Pro;
-        let (_details, state) = presence_lines(&session, Some(&session.limits), &config);
+        let config = PresenceConfig::default();
+        let plan = resolved_plan_pro();
+        let (_details, state) = presence_lines(&session, Some(&session.limits), &plan, &config);
         let model_pos = state.find("GPT-5.3-Codex-Ultra-Long-Variant-Name-For-Tests | Pro");
         let cost_pos = state.find('$');
         assert!(model_pos.is_some(), "state must keep model+plan");
@@ -712,7 +898,8 @@ mod tests {
             pending_calls: 0,
         });
         let config = PresenceConfig::default();
-        let (details, _state) = presence_lines(&session, Some(&session.limits), &config);
+        let plan = resolved_plan_pro();
+        let (details, _state) = presence_lines(&session, Some(&session.limits), &plan, &config);
         assert_eq!(
             details,
             "Running command rg --files - project-alpha (feature/main)"
@@ -743,7 +930,8 @@ mod tests {
             pending_calls: 0,
         });
         let config = PresenceConfig::default();
-        let (details, state) = presence_lines(&session, Some(&session.limits), &config);
+        let plan = resolved_plan_pro();
+        let (details, state) = presence_lines(&session, Some(&session.limits), &plan, &config);
         assert!(details.starts_with("Editing"));
         assert!(details.contains("project-alpha"));
         assert!(state.contains("GPT-5.3-Codex"));
@@ -807,5 +995,32 @@ mod tests {
         let keys = parse_discord_asset_keys(json).expect("keys");
         assert!(keys.contains("codex-logo"));
         assert!(keys.contains("openai"));
+    }
+
+    #[test]
+    fn detect_surface_uses_desktop_originator() {
+        let mut session = sample_session();
+        session.originator = Some("Codex Desktop".to_string());
+        assert_eq!(
+            detect_surface(Some(&session)),
+            Some(PresenceSurface::Desktop)
+        );
+    }
+
+    #[test]
+    fn display_branding_uses_desktop_keys() {
+        let mut config = PresenceConfig::default();
+        config.display.desktop_large_image_key = "codex-app".to_string();
+        config.display.desktop_large_text = "Codex App".to_string();
+        let branding = display_branding(PresenceSurface::Desktop, &config);
+        assert_eq!(branding.large_image_key, "codex-app");
+        assert_eq!(branding.large_text, "Codex App");
+        assert_eq!(branding.idle_details, "Codex App");
+    }
+
+    #[test]
+    fn desktop_missing_client_status_is_explicit() {
+        let status = status_for_client_id(PresenceSurface::Desktop, None);
+        assert_eq!(status, "Missing desktop Discord client id");
     }
 }

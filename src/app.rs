@@ -4,23 +4,28 @@ use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use std::{io, io::IsTerminal};
 
 use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
 use crossterm::event::{self, Event, KeyCode, KeyModifiers};
 use tracing::debug;
 
-use crate::config::{self, PresenceConfig, RuntimeSettings};
+use crate::config::{self, PresenceConfig, PresenceSurface, RuntimeSettings};
 use crate::discord::DiscordPresence;
 use crate::metrics::MetricsTracker;
 use crate::process_guard::{self, RunningState};
 use crate::session::{
-    CodexSessionSnapshot, GitBranchCache, RateLimits, SessionParseCache,
-    collect_active_sessions_multi, latest_limits_source, preferred_active_session,
+    CodexSessionSnapshot, EffectiveLimitSelection, GitBranchCache, RateLimits, SessionParseCache,
+    collect_active_sessions_multi, collect_active_sessions_multi_with_diagnostics,
+    latest_limits_source, preferred_active_session,
 };
+use crate::telemetry::plan::{PlanDetector, ResolvedPlan, is_model_allowed_for_plan};
 use crate::ui::{self, RenderData};
-use crate::util::{format_cost, format_model_name, format_time_until, format_token_triplet};
+use crate::util::{
+    format_cost, format_model_name, format_since, format_time_until, format_token_triplet,
+};
 
 const RELAUNCH_GUARD_ENV: &str = "CODEX_PRESENCE_TERMINAL_RELAUNCHED";
 
@@ -42,7 +47,7 @@ pub fn print_status(config: &PresenceConfig) -> Result<()> {
     let session_roots = config::sessions_paths();
     let mut cache = GitBranchCache::new(Duration::from_secs(30));
     let mut parse_cache = SessionParseCache::default();
-    let sessions = collect_active_sessions_multi(
+    let (sessions, diagnostics) = collect_active_sessions_multi_with_diagnostics(
         &session_roots,
         runtime.stale_threshold,
         runtime.active_sticky_window,
@@ -63,27 +68,48 @@ pub fn print_status(config: &PresenceConfig) -> Result<()> {
     }
     println!("config: {}", config::config_path().display());
     print_session_roots("sessions_dirs", &session_roots);
+    let default_client_id = config.effective_client_id_for_surface(PresenceSurface::Default);
+    let desktop_client_id = config.effective_client_id_for_surface(PresenceSurface::Desktop);
     println!(
-        "discord_client_id: {}",
-        if config.effective_client_id().is_some() {
+        "discord_client_id_default: {}",
+        if default_client_id.is_some() {
+            "configured"
+        } else {
+            "missing"
+        }
+    );
+    println!(
+        "discord_client_id_desktop: {}",
+        if desktop_client_id.is_some() {
             "configured"
         } else {
             "missing"
         }
     );
     println!("active_sessions: {}", sessions.len());
+    println!("session_files_seen: {}", diagnostics.session_files_seen);
+    println!("discarded_stale: {}", diagnostics.dropped_stale);
+    println!(
+        "discarded_outside_sticky: {}",
+        diagnostics.dropped_outside_sticky
+    );
+    let mut plan_detector = PlanDetector::new();
+    let resolved_plan = plan_detector.resolve_from_sessions(&sessions);
     if let Some(active) = preferred_active_session(&sessions) {
         let limits_source = latest_limits_source(&sessions);
-        if let Some(source) = limits_source {
-            println!("limits_source_session: {}", source.session_id);
+        if let Some(source) = &limits_source {
+            println!("limits_source_session: {}", source.source_session_id);
+            println!("limits_source: {}", source.source_label());
+            println!("limits_updated: {}", format_since(source.observed_at));
         }
-        let openai_plan_label = config.openai_plan.label();
         print_active_summary(
             active,
-            limits_source.map(|source| &source.limits),
+            limits_source.as_ref().map(|source| &source.limits),
+            limits_source.as_ref(),
             config.privacy.show_activity,
             config.privacy.show_activity_target,
-            &openai_plan_label,
+            &resolved_plan,
+            config.openai_plan.show_price,
         );
     }
     Ok(())
@@ -108,11 +134,25 @@ pub fn doctor(config: &PresenceConfig) -> Result<u8> {
         );
     }
 
-    if config.effective_client_id().is_none() {
+    let default_client_id = config.effective_client_id_for_surface(PresenceSurface::Default);
+    let desktop_client_id = config.effective_client_id_for_surface(PresenceSurface::Desktop);
+    if default_client_id.is_none() && desktop_client_id.is_none() {
         issues += 1;
-        println!("[WARN] Discord client id not configured.");
+        println!("[WARN] Discord client ids are not configured.");
     } else {
-        println!("[OK] Discord client id configured.");
+        println!(
+            "[OK] Discord client ids: default={} desktop={}",
+            if default_client_id.is_some() {
+                "configured"
+            } else {
+                "missing"
+            },
+            if desktop_client_id.is_some() {
+                "configured"
+            } else {
+                "missing"
+            }
+        );
     }
 
     if command_available("codex") {
@@ -155,6 +195,7 @@ fn run_foreground_tui(config: PresenceConfig, runtime: RuntimeSettings) -> Resul
     let mut parse_cache = SessionParseCache::default();
     let mut discord = DiscordPresence::new(config.effective_client_id());
     let mut metrics_tracker = MetricsTracker::new();
+    let mut plan_detector = PlanDetector::new();
     let sessions_roots = config::sessions_paths();
     let started = Instant::now();
     let mut last_tick = Instant::now() - runtime.poll_interval;
@@ -183,26 +224,57 @@ fn run_foreground_tui(config: PresenceConfig, runtime: RuntimeSettings) -> Resul
                 metrics_tracker.update(&sessions);
                 metrics_tracker.persist_if_due();
                 let active = preferred_active_session(&sessions);
-                let effective_limits = latest_limits_source(&sessions).map(|source| &source.limits);
-                if let Err(err) = discord.update(active, effective_limits, &config) {
+                let effective_limits = latest_limits_source(&sessions);
+                let resolved_plan = plan_detector.resolve_from_sessions(&sessions);
+                if let Err(err) = discord.update(
+                    active,
+                    effective_limits.as_ref().map(|source| &source.limits),
+                    &resolved_plan,
+                    &config,
+                ) {
                     debug!(error = %err, "discord presence update failed");
                 }
 
-                let openai_plan_label = config.openai_plan.label();
+                let plan_display_label = resolved_plan.label(config.openai_plan.show_price);
+                let plan_auto_label = resolved_plan.auto_label();
+                let limits_source_label = effective_limits
+                    .as_ref()
+                    .map(|selection| selection.source_label())
+                    .unwrap_or_else(|| "Awaiting account quota telemetry".to_string());
+                let limits_updated_label = effective_limits
+                    .as_ref()
+                    .map(|selection| format_since(selection.observed_at))
+                    .unwrap_or_else(|| "not yet synced".to_string());
+                let spark_plan_warning = active
+                    .and_then(|session| session.model.as_deref())
+                    .and_then(|model| {
+                        (!is_model_allowed_for_plan(model, resolved_plan.tier))
+                            .then_some("Spark is Pro-only; received non-Pro telemetry (anomaly)")
+                    });
                 let render = RenderData {
                     running_for: started.elapsed(),
                     mode_label: "Smart Foreground",
                     discord_status: discord.status(),
-                    client_id_configured: config.effective_client_id().is_some(),
+                    client_id_configured: config
+                        .effective_client_id_for_surface(PresenceSurface::Default)
+                        .is_some()
+                        || config
+                            .effective_client_id_for_surface(PresenceSurface::Desktop)
+                            .is_some(),
                     poll_interval_secs: runtime.poll_interval.as_secs(),
                     stale_secs: runtime.stale_threshold.as_secs(),
                     show_activity: config.privacy.show_activity,
                     show_activity_target: config.privacy.show_activity_target,
-                    openai_plan_label: openai_plan_label.as_str(),
+                    plan_display_label: plan_display_label.as_str(),
+                    plan_auto_label: plan_auto_label.as_str(),
+                    limits_source_label: limits_source_label.as_str(),
+                    limits_updated_label: limits_updated_label.as_str(),
+                    spark_plan_warning,
                     logo_mode: config.display.terminal_logo_mode.clone(),
                     logo_path: config.display.terminal_logo_path.as_deref(),
+                    banner_phase: ((started.elapsed().as_millis() / 450) % 8) as u8,
                     active,
-                    effective_limits,
+                    effective_limits: effective_limits.as_ref().map(|source| &source.limits),
                     metrics: metrics_tracker.snapshot(),
                     sessions: &sessions,
                 };
@@ -219,7 +291,16 @@ fn run_foreground_tui(config: PresenceConfig, runtime: RuntimeSettings) -> Resul
                 last_tick = Instant::now();
             }
 
-            if event::poll(Duration::from_millis(100))? {
+            let wait_budget = if last_tick.elapsed() >= runtime.poll_interval {
+                Duration::from_millis(10)
+            } else {
+                runtime
+                    .poll_interval
+                    .saturating_sub(last_tick.elapsed())
+                    .min(Duration::from_millis(250))
+            };
+
+            if event::poll(wait_budget)? {
                 match event::read()? {
                     Event::Key(key) => {
                         if key.code == KeyCode::Char('q')
@@ -254,6 +335,7 @@ fn run_headless_foreground(
     let mut parse_cache = SessionParseCache::default();
     let mut discord = DiscordPresence::new(config.effective_client_id());
     let mut metrics_tracker = MetricsTracker::new();
+    let mut plan_detector = PlanDetector::new();
     let sessions_roots = config::sessions_paths();
     println!("No interactive terminal detected; running in headless foreground mode.");
     println!("Press Ctrl+C to stop.");
@@ -270,8 +352,14 @@ fn run_headless_foreground(
         metrics_tracker.update(&sessions);
         metrics_tracker.persist_if_due();
         let active = preferred_active_session(&sessions);
-        let effective_limits = latest_limits_source(&sessions).map(|source| &source.limits);
-        if let Err(err) = discord.update(active, effective_limits, &config) {
+        let effective_limits = latest_limits_source(&sessions);
+        let resolved_plan = plan_detector.resolve_from_sessions(&sessions);
+        if let Err(err) = discord.update(
+            active,
+            effective_limits.as_ref().map(|source| &source.limits),
+            &resolved_plan,
+            &config,
+        ) {
             debug!(error = %err, "discord presence update failed");
         }
         thread::sleep(runtime.poll_interval);
@@ -439,6 +527,7 @@ fn run_codex_wrapper(
     let mut parse_cache = SessionParseCache::default();
     let mut discord = DiscordPresence::new(config.effective_client_id());
     let mut metrics_tracker = MetricsTracker::new();
+    let mut plan_detector = PlanDetector::new();
     let sessions_roots = config::sessions_paths();
 
     println!("codex child started; Discord presence tracking is active.");
@@ -460,8 +549,14 @@ fn run_codex_wrapper(
         metrics_tracker.update(&sessions);
         metrics_tracker.persist_if_due();
         let active = preferred_active_session(&sessions);
-        let effective_limits = latest_limits_source(&sessions).map(|source| &source.limits);
-        if let Err(err) = discord.update(active, effective_limits, &config) {
+        let effective_limits = latest_limits_source(&sessions);
+        let resolved_plan = plan_detector.resolve_from_sessions(&sessions);
+        if let Err(err) = discord.update(
+            active,
+            effective_limits.as_ref().map(|source| &source.limits),
+            &resolved_plan,
+            &config,
+        ) {
             debug!(error = %err, "discord presence update failed");
         }
 
@@ -495,18 +590,35 @@ fn spawn_codex_child(args: Vec<String>) -> Result<Child> {
 fn print_active_summary(
     active: &CodexSessionSnapshot,
     effective_limits: Option<&RateLimits>,
+    limits_source: Option<&EffectiveLimitSelection>,
     show_activity: bool,
     show_activity_target: bool,
-    openai_plan_label: &str,
+    resolved_plan: &ResolvedPlan,
+    show_price: bool,
 ) {
+    let plan_display_label = resolved_plan.label(show_price);
     println!("active_session:");
+    println!("  session_id: {}", active.session_id);
     println!("  project: {}", active.project_name);
     println!("  path: {}", active.cwd.display());
+    if let Some(started_at) = active.started_at.as_ref() {
+        let started_at_iso = started_at.to_rfc3339();
+        let started_at_since = format_since(Some(started_at.to_owned()));
+        println!("  started_at: {started_at_iso} ({started_at_since})");
+    } else {
+        println!("  started_at: n/a");
+    }
+    let last_activity_dt: DateTime<Utc> = DateTime::<Utc>::from(active.last_activity);
+    let last_activity_iso = last_activity_dt.to_rfc3339();
+    let last_activity_since = format_since(Some(last_activity_dt));
+    println!("  last_activity: {last_activity_iso} ({last_activity_since})");
+    println!("  recency_source: {}", recency_source_label(active));
     println!(
         "  model: {} | {}",
         format_model_name(active.model.as_deref().unwrap_or("unknown")),
-        openai_plan_label
+        plan_display_label
     );
+    println!("  plan: {}", resolved_plan.auto_label());
     println!(
         "  branch: {}",
         active.git_branch.as_deref().unwrap_or("n/a")
@@ -541,6 +653,10 @@ fn print_active_summary(
     } else {
         println!("  context: n/a");
     }
+    if let Some(source) = limits_source {
+        println!("  limits source: {}", source.source_label());
+        println!("  limits updated: {}", format_since(source.observed_at));
+    }
 
     let limits = effective_limits.unwrap_or(&active.limits);
     if let Some(primary) = &limits.primary {
@@ -556,6 +672,11 @@ fn print_active_summary(
             secondary.remaining_percent,
             format_time_until(secondary.resets_at)
         );
+    }
+    if let Some(model) = active.model.as_deref()
+        && !is_model_allowed_for_plan(model, resolved_plan.tier)
+    {
+        println!("  model gate: Spark is Pro-only (telemetry anomaly)");
     }
 }
 
@@ -574,6 +695,40 @@ fn print_session_roots(label: &str, paths: &[PathBuf]) {
     for path in paths {
         println!("  - {}", path.display());
     }
+}
+
+fn recency_source_label(active: &CodexSessionSnapshot) -> &'static str {
+    let last_activity = active.last_activity;
+    if let Some(activity) = &active.activity {
+        if activity
+            .last_effective_signal_at
+            .and_then(datetime_to_system_time)
+            == Some(last_activity)
+        {
+            return "activity.last_effective_signal_at";
+        }
+        if activity.last_active_at.and_then(datetime_to_system_time) == Some(last_activity) {
+            return "activity.last_active_at";
+        }
+        if activity.observed_at.and_then(datetime_to_system_time) == Some(last_activity) {
+            return "activity.observed_at";
+        }
+    }
+    if active.last_token_event_at.and_then(datetime_to_system_time) == Some(last_activity) {
+        return "last_token_event_at";
+    }
+    "file_modified_or_fallback"
+}
+
+fn datetime_to_system_time(ts: DateTime<Utc>) -> Option<SystemTime> {
+    if ts.timestamp() < 0 {
+        return None;
+    }
+    let secs = ts.timestamp() as u64;
+    let nanos = ts.timestamp_subsec_nanos() as u64;
+    SystemTime::UNIX_EPOCH
+        .checked_add(Duration::from_secs(secs))?
+        .checked_add(Duration::from_nanos(nanos))
 }
 
 fn install_stop_signal() -> Result<Arc<AtomicBool>> {

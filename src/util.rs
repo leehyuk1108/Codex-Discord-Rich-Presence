@@ -148,6 +148,18 @@ pub fn now_local() -> String {
     Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
 }
 
+pub fn format_since(target: Option<DateTime<Utc>>) -> String {
+    let Some(target) = target else {
+        return "n/a".to_string();
+    };
+    let now = Utc::now();
+    if target >= now {
+        return "just now".to_string();
+    }
+    let delta = (now - target).to_std().unwrap_or_default();
+    format!("{} ago", human_duration(delta))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

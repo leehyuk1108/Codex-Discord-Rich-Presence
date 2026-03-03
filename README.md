@@ -1,7 +1,7 @@
-# Codex Discord Presence
+# Codex Discord Rich Presence
 
 <p align="center">
-  <img src="assets/branding/social-card.svg" alt="Codex Discord Presence social card" width="960" />
+  <img src="assets/branding/social-card.svg" alt="Codex Discord Rich Presence social card" width="960" />
 </p>
 
 <p align="center">
@@ -12,55 +12,77 @@
   <img src="https://img.shields.io/badge/Discord-Rich%20Presence-5865F2?logo=discord" alt="Discord Rich Presence">
 </p>
 
-<p align="center"><strong>Real-time Discord Rich Presence for Codex CLI sessions.</strong></p>
+<p align="center"><strong>Minimal, real-time Discord Rich Presence for Codex CLI, VS Code, and Codex App.</strong></p>
 
-## Overview
+## About
 
-`codex-discord-presence` reads local Codex session JSONL files from discovered session roots (for example `~/.codex/sessions`, Windows `%USERPROFILE%\\.codex\\sessions`, and WSL homes when available), detects live activity (`Thinking`, `Reading`, `Editing`, `Running`, `Waiting for input`), renders an adaptive terminal dashboard, and updates Discord Rich Presence with low overhead.
+GitHub About text (copy/paste):
 
-## Core Capabilities
+`Real-time Discord Rich Presence for Codex. Auto-detects CLI/VS Code vs Codex App and switches branding, client ID, and assets accordingly.`
 
-- Stable multi-session detection with anti-false-idle behavior.
-- Discord Rich Presence keepalive in idle mode (persistent idle card + heartbeat + reconnect backoff).
-- Always-visible `Recent Sessions` section with adaptive compact fallback.
-- Action-first Discord details/state with deterministic truncation and compact token/cost telemetry.
-- Accurate context-window usage from active turn usage (`last_token_usage`) instead of cumulative session totals.
-- Accurate command activity classification for modern Codex tool calls (`exec_command` + `shell_command`).
-- Human-readable model labels (`GPT-5.3-Codex`, `GPT-5.1-Codex-Mini`) with OpenAI plan label next to model.
-- Full metrics tracking with per-model aggregation and persisted reports (`JSON` + `Markdown`).
-- File activity labels sanitized to basename (`Editing test.ts` instead of full path).
-- Semantic remaining-limit bars (`5h`, `7d`) with color thresholds.
-- Incremental parse cache and render/publish dedupe for low CPU and memory use.
+Suggested GitHub topics:
 
-## Install
+`codex` `codex-app` `codex-cli` `vscode` `discord` `rich-presence` `rust` `desktop`
 
-### Build from source
+## Why this project
+
+`codex-discord-presence` is a low-overhead Rust runtime that reads local Codex session JSONL files, detects live coding activity, and publishes clean Discord presence updates with stable idle behavior.
+
+It is designed for:
+
+- Codex CLI users
+- VS Code Codex workflows
+- Codex App (Desktop) users on Windows, Linux, and macOS
+
+## Key Features
+
+- Automatic surface detection from `session_meta` (`originator`/`source`):
+  - CLI/VS Code -> `Codex` Discord app profile
+  - Codex App (Desktop) -> `Codex App` profile (dedicated client ID and artwork)
+- Real-time activity classification (`Thinking`, `Reading`, `Editing`, `Running`, `Waiting for input`)
+- Minimal, readable Discord card text with deterministic truncation
+- Stable multi-session ranking with anti-false-idle logic
+- Global-first 5h/7d limits selection (`limit_id=codex` preference)
+- Auto plan label detection from telemetry (`free`, `plus`, `pro`, etc.) with cache fallback
+- Per-model tokens/cost metrics persisted to JSON + Markdown
+- Adaptive TUI refresh and deduplicated Discord updates for low CPU usage
+- Dynamic Discord client switching when session surface changes
+
+## Quick Start
+
+1. Create Discord assets:
+   - CLI/VS Code app: main logo (`codex-logo`) + small icon (`openai`)
+   - Codex App desktop app: desktop logo (`codex-app`) + small icon (`openai`)
+2. Build binary:
+   - Windows: `./scripts/build-release.ps1`
+   - Linux/macOS: `./scripts/build-release.sh`
+3. Run:
+   - `codex-discord-presence`
+4. Optional diagnostics:
+   - `codex-discord-presence status`
+   - `codex-discord-presence doctor`
+
+## Install and Releases
+
+Build from source:
 
 ```bash
 cargo build --release
 ```
 
-Local build output (Cargo target directory):
+Release binaries:
 
-- Windows: `releases/windows/codex-discord-presence.exe` (via `build-dist.ps1`)
-- Linux/macOS: standard Cargo target output for your host toolchain
+- [GitHub Releases](https://github.com/xt0n1-t3ch/Codex-Discord-Rich-Presence/releases)
+- Output layout:
+  - `releases/windows/codex-discord-rich-presence.exe`
+  - `releases/linux/codex-discord-rich-presence`
+  - `releases/macos/codex-discord-rich-presence`
 
-Windows convenience build (writes only under `releases/`):
+Windows executable branding:
 
-```powershell
-./build-dist.ps1
-```
+- `.exe` icon is embedded from `assets/branding/codex-app.png` during build.
 
-Direct executable paths after `build-dist.ps1`:
-
-- `releases/windows/codex-discord-presence.exe`
-- `releases/windows/codex-discord-presence.next.exe` (only if the main `.exe` is locked)
-
-### Download release binaries
-
-- Releases: `https://github.com/xt0n1-t3ch/Codex-Discord-Rich-Presence/releases`
-
-## Usage
+## Commands
 
 ```bash
 codex-discord-presence
@@ -75,55 +97,48 @@ Config file:
 
 - `~/.codex/discord-presence-config.json`
 
-Defaults:
+Important defaults:
 
-- `schema_version`: `5`
+- `schema_version`: `7`
 - `discord_client_id`: `1470480085453770854`
+- `discord_client_id_desktop`: `1478395304624652345`
 - `display.large_image_key`: `codex-logo`
+- `display.desktop_large_image_key`: `codex-app`
+- `display.desktop_large_text`: `Codex App`
 - `display.small_image_key`: `openai`
 - `privacy.show_cost`: `true`
-- `openai_plan.tier`: `pro`
 - `openai_plan.show_price`: `true`
 - `poll_interval_seconds`: `2`
-- `active_sticky_window_seconds`: `3600` (runtime env)
-- `pricing.aliases.gpt-5.3-codex`: `gpt-5.2-codex`
-
-Pricing config supports:
-
-- `pricing.aliases`: map model ids to another model's catalog pricing.
-- `pricing.overrides`: explicit per-model pricing override in USD per million tokens.
-- `openai_plan`: display tier next to model in Discord/TUI (`free`, `go`, `plus`, `pro`).
-
-Metrics artifacts:
-
-- `~/.codex/discord-presence-metrics.json`
-- `~/.codex/discord-presence-metrics.md`
 
 Environment overrides:
 
 - `CODEX_DISCORD_CLIENT_ID`
+- `CODEX_DISCORD_CLIENT_ID_DESKTOP`
 - `CODEX_PRESENCE_STALE_SECONDS`
 - `CODEX_PRESENCE_POLL_SECONDS`
 - `CODEX_PRESENCE_ACTIVE_STICKY_SECONDS`
 - `CODEX_HOME`
 
-## Discord Asset Setup
+## Surface Detection (CLI/VS Code vs Codex App)
 
-1. Open Discord desktop app.
-2. In Discord Developer Portal, configure image assets for the same `discord_client_id`:
-   - `codex-logo` (large image)
-   - `openai` (small image fallback)
-3. Optional: add per-activity small image keys in config (`display.activity_small_image_keys`).
-4. `display.*_image_key` can be an uploaded asset key or an `https://` image URL.
-5. If a configured key does not exist in the app asset catalog, the app now falls back to a safe icon payload (prevents `?` placeholder on Discord mobile).
+- Desktop mode is detected when `session_meta.originator` contains `desktop`.
+- Fallback: if `session_meta.source` contains `desktop`, desktop mode is used.
+- Otherwise the runtime uses CLI/VS Code mode.
+- Idle state preserves the last active surface, so branding stays consistent.
 
-## Documentation
+## Performance Profile
 
-- Docs index: `docs/README.md`
-- API: `docs/api/codex-presence.md`
-- UI: `docs/ui/UI_SITEMAP.md`
-- Config schema: `docs/database/schema.md`
-- Contributors: `CONTRIBUTORS.md`
+- Rust native binary (no Electron runtime)
+- Release profile: `lto=thin`, `panic=abort`, `strip=true`, single codegen unit
+- Adaptive terminal event polling to minimize idle CPU usage
+- Presence publish dedupe + heartbeat/reconnect strategy
+
+## Docs
+
+- [docs/README.md](docs/README.md)
+- [docs/api/codex-presence.md](docs/api/codex-presence.md)
+- [docs/database/schema.md](docs/database/schema.md)
+- [docs/ui/UI_SITEMAP.md](docs/ui/UI_SITEMAP.md)
 
 ## Credits
 
@@ -139,9 +154,9 @@ Environment overrides:
 
 ## Security and Privacy
 
-- Reads local Codex session files only.
-- No external telemetry pipeline is implemented.
-- See `PRIVACY.md` and `SECURITY.md`.
+- Reads local Codex session files only
+- No external telemetry pipeline
+- See `PRIVACY.md` and `SECURITY.md`
 
 ## License
 
