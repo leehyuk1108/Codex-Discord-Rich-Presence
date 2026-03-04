@@ -1,42 +1,31 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 420" role="img" aria-labelledby="title desc">
-  <title id="title">Codex Discord Rich Presence Runtime Map</title>
-  <desc id="desc">Ultra-dark two-panel map showing session surfaces and runtime detection logic.</desc>
-  <defs>
-    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0%" stop-color="#040404"/>
-      <stop offset="100%" stop-color="#0a0a0a"/>
-    </linearGradient>
-    <linearGradient id="panel" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0%" stop-color="#090909"/>
-      <stop offset="100%" stop-color="#111111"/>
-    </linearGradient>
-    <linearGradient id="card" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0%" stop-color="#0e0e0e"/>
-      <stop offset="100%" stop-color="#161616"/>
-    </linearGradient>
-  </defs>
+  <title id="title">Why This Runtime</title>
+  <desc id="desc">True-black runtime overview with clear decision flow and minimal copy.</desc>
 
-  <rect width="1280" height="420" fill="url(#bg)"/>
-  <rect x="28" y="24" width="1224" height="372" rx="24" fill="url(#panel)" stroke="#232323"/>
+  <rect width="1280" height="420" fill="#000000"/>
+  <rect x="24" y="24" width="1232" height="372" rx="24" fill="#000000" stroke="#262626"/>
 
-  <text x="640" y="76" fill="#ffffff" font-size="40" font-family="Segoe UI, Arial, sans-serif" font-weight="700" text-anchor="middle">Automatic Profile Selection</text>
-  <text x="640" y="108" fill="#b9b9b9" font-size="20" font-family="Segoe UI, Arial, sans-serif" text-anchor="middle">One runtime, two profile paths, zero manual switching.</text>
+  <text x="640" y="78" fill="#ffffff" font-size="42" font-family="Segoe UI, Arial, sans-serif" font-weight="700" text-anchor="middle">Why This Runtime</text>
+  <text x="640" y="110" fill="#bdbdbd" font-size="20" font-family="Segoe UI, Arial, sans-serif" text-anchor="middle">One binary. Surface-aware routing. Stable Discord presence.</text>
 
-  <rect x="84" y="150" width="516" height="212" rx="18" fill="url(#card)" stroke="#2b2b2b"/>
-  <rect x="680" y="150" width="516" height="212" rx="18" fill="url(#card)" stroke="#2b2b2b"/>
+  <line x1="430" y1="150" x2="430" y2="338" stroke="#2f2f2f"/>
+  <line x1="850" y1="150" x2="850" y2="338" stroke="#2f2f2f"/>
 
-  <text x="342" y="196" fill="#ffffff" font-size="33" font-family="Segoe UI, Arial, sans-serif" font-weight="700" text-anchor="middle">Session Surfaces</text>
-  <text x="342" y="236" fill="#d0d0d0" font-size="22" font-family="Segoe UI, Arial, sans-serif" text-anchor="middle">Codex CLI</text>
-  <text x="342" y="266" fill="#d0d0d0" font-size="22" font-family="Segoe UI, Arial, sans-serif" text-anchor="middle">Codex VS Code Extension</text>
-  <text x="342" y="296" fill="#d0d0d0" font-size="22" font-family="Segoe UI, Arial, sans-serif" text-anchor="middle">Codex App</text>
-  <text x="342" y="334" fill="#9c9c9c" font-size="18" font-family="Segoe UI, Arial, sans-serif" text-anchor="middle">The runtime observes active surface metadata.</text>
+  <text x="220" y="186" fill="#ffffff" font-size="30" font-family="Segoe UI, Arial, sans-serif" font-weight="700" text-anchor="middle">Surface Aware</text>
+  <text x="220" y="228" fill="#d0d0d0" font-size="22" font-family="Segoe UI, Arial, sans-serif" text-anchor="middle">Detects Codex CLI</text>
+  <text x="220" y="260" fill="#d0d0d0" font-size="22" font-family="Segoe UI, Arial, sans-serif" text-anchor="middle">VS Code Extension</text>
+  <text x="220" y="292" fill="#d0d0d0" font-size="22" font-family="Segoe UI, Arial, sans-serif" text-anchor="middle">and Codex App desktop</text>
 
-  <text x="938" y="196" fill="#ffffff" font-size="33" font-family="Segoe UI, Arial, sans-serif" font-weight="700" text-anchor="middle">Runtime Detection</text>
-  <text x="938" y="234" fill="#d0d0d0" font-size="20" font-family="Segoe UI, Arial, sans-serif" text-anchor="middle">Reads `session_meta.originator` / `session_meta.source`</text>
-  <text x="938" y="266" fill="#c5c5c5" font-size="20" font-family="Segoe UI, Arial, sans-serif" text-anchor="middle">Selects `discord_client_id` or `discord_client_id_desktop`</text>
-  <text x="938" y="298" fill="#c5c5c5" font-size="20" font-family="Segoe UI, Arial, sans-serif" text-anchor="middle">Applies matching assets (`codex-logo` / `codex-app`)</text>
-  <text x="938" y="334" fill="#9c9c9c" font-size="18" font-family="Segoe UI, Arial, sans-serif" text-anchor="middle">Presence updates stay consistent while surface changes.</text>
+  <text x="640" y="186" fill="#ffffff" font-size="30" font-family="Segoe UI, Arial, sans-serif" font-weight="700" text-anchor="middle">Deterministic Routing</text>
+  <text x="640" y="228" fill="#d0d0d0" font-size="21" font-family="Segoe UI, Arial, sans-serif" text-anchor="middle">1) originator contains desktop</text>
+  <text x="640" y="260" fill="#d0d0d0" font-size="21" font-family="Segoe UI, Arial, sans-serif" text-anchor="middle">2) fallback to source contains desktop</text>
+  <text x="640" y="292" fill="#d0d0d0" font-size="21" font-family="Segoe UI, Arial, sans-serif" text-anchor="middle">3) otherwise use Codex CLI profile</text>
 
-  <line x1="600" y1="256" x2="680" y2="256" stroke="#8a8a8a" stroke-width="3" stroke-linecap="round"/>
-  <polygon points="674,248 694,256 674,264" fill="#8a8a8a"/>
+  <text x="1060" y="186" fill="#ffffff" font-size="30" font-family="Segoe UI, Arial, sans-serif" font-weight="700" text-anchor="middle">Reliable Presence</text>
+  <text x="1060" y="228" fill="#d0d0d0" font-size="22" font-family="Segoe UI, Arial, sans-serif" text-anchor="middle">Low-overhead polling</text>
+  <text x="1060" y="260" fill="#d0d0d0" font-size="22" font-family="Segoe UI, Arial, sans-serif" text-anchor="middle">Deduplicated payload updates</text>
+  <text x="1060" y="292" fill="#d0d0d0" font-size="22" font-family="Segoe UI, Arial, sans-serif" text-anchor="middle">Reconnect backoff for IPC</text>
+
+  <line x1="120" y1="338" x2="1160" y2="338" stroke="#3a3a3a" stroke-opacity="0.6"/>
+  <text x="640" y="370" fill="#9f9f9f" font-size="18" font-family="Segoe UI, Arial, sans-serif" text-anchor="middle">Client IDs and assets are selected automatically per active surface.</text>
 </svg>
