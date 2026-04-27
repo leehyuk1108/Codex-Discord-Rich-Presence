@@ -480,32 +480,26 @@ fn presence_lines(
         return ("Using Codex".to_string(), "In a coding session".to_string());
     }
 
-    let surface_label = if session.is_desktop_surface() {
-        "Codex App"
-    } else {
-        "Codex"
-    };
     let project_label = if config.privacy.show_project_name {
         session.project_name.clone()
     } else {
         "private project".to_string()
     };
-
-    let details = if config.privacy.show_project_name {
-        let mut details_parts = vec![surface_label.to_string(), project_label.clone()];
+    let project_fallback = if config.privacy.show_project_name {
+        let mut parts = vec![project_label.clone()];
         if config.privacy.show_git_branch
             && let Some(branch) = &session.git_branch
         {
-            details_parts.push(branch.clone());
+            parts.push(branch.clone());
         }
-        details_parts.join(" · ")
+        parts.join(" • ")
     } else {
-        surface_label.to_string()
+        "Codex session".to_string()
     };
 
     let limits = effective_limits.unwrap_or(&session.limits);
 
-    let mut state_parts: Vec<String> = Vec::new();
+    let mut details_parts: Vec<String> = Vec::new();
     if config.privacy.show_model
         && let Some(model) = &session.model
     {
@@ -514,16 +508,18 @@ fn presence_lines(
             session.reasoning_effort,
             resolved_service_tier.is_fast(),
         );
-        state_parts.push(truncate_for_limit(&label, 72));
+        details_parts.push(truncate_for_limit(&label, 72));
     }
     if config.privacy.show_activity
         && let Some(activity) = &session.activity
     {
-        state_parts.push(activity_presence_text(
+        details_parts.push(activity_presence_text(
             activity,
             config.privacy.show_activity_target,
         ));
     }
+
+    let mut state_parts: Vec<String> = Vec::new();
     let mut has_usage_summary = false;
     if config.privacy.show_tokens
         && let Some(context) = context_state_part(session)
@@ -543,12 +539,8 @@ fn presence_lines(
         state_parts.push(limits_part);
     }
 
-    let fallback = if config.privacy.show_project_name {
-        project_label.as_str()
-    } else {
-        "Codex session"
-    };
-    let state = compact_join_prioritized(&state_parts, 128, fallback, " · ");
+    let details = compact_join_prioritized(&details_parts, 128, &project_fallback, " • ");
+    let state = compact_join_prioritized(&state_parts, 128, &project_fallback, " • ");
     (truncate_for_limit(&details, 128), state)
 }
 
@@ -923,14 +915,15 @@ mod tests {
         let config = PresenceConfig::default();
         let plan = resolved_plan_pro();
         let service_tier = resolved_service_tier(false);
-        let (_details, state) = presence_lines(
+        let (details, state) = presence_lines(
             &session,
             Some(&session.limits),
             &plan,
             &service_tier,
             &config,
         );
-        assert_eq!(state, "GPT-5.3-Codex · Ctx 94% · $1.23 / 30.0K tok");
+        assert_eq!(details, "GPT-5.3-Codex");
+        assert_eq!(state, "Ctx 94% • $1.23 / 30.0K tok");
         assert!(state.contains('$'));
         assert!(state.contains("tok"));
         assert!(!state.contains("5h"));
@@ -943,20 +936,20 @@ mod tests {
         let config = PresenceConfig::default();
         let plan = resolved_plan_pro();
         let service_tier = resolved_service_tier(false);
-        let (_details, state) = presence_lines(
+        let (details, state) = presence_lines(
             &session,
             Some(&session.limits),
             &plan,
             &service_tier,
             &config,
         );
-        let model_pos = state.find("GPT-5.3-Codex-Ultra-Long-Variant-Name-For-Tests");
-        assert!(model_pos.is_some(), "state must keep model summary");
+        let model_pos = details.find("GPT-5.3-Codex-Ultra-Long-Variant-Name-For-Tests");
+        assert!(model_pos.is_some(), "details must keep model summary");
         assert!(state.contains('$'), "state should include cost summary");
     }
 
     #[test]
-    fn details_use_surface_project_format() {
+    fn details_use_model_activity_format() {
         let mut session = sample_session();
         session.activity = Some(crate::session::SessionActivitySnapshot {
             kind: crate::session::SessionActivityKind::RunningCommand,
@@ -977,7 +970,7 @@ mod tests {
             &service_tier,
             &config,
         );
-        assert_eq!(details, "Codex · project-alpha · feature/main");
+        assert_eq!(details, "GPT-5.3-Codex • Running command rg --files");
     }
 
     #[test]
@@ -1013,26 +1006,26 @@ mod tests {
             &service_tier,
             &config,
         );
-        assert_eq!(details, "Codex · project-alpha · feature/main");
-        assert!(state.contains("GPT-5.3-Codex"));
-        assert!(state.contains("Editing main.rs"));
+        assert_eq!(details, "GPT-5.3-Codex • Editing main.rs");
+        assert!(!details.contains("Codex · project-alpha"));
+        assert!(state.contains("Ctx 94%"));
     }
 
     #[test]
-    fn state_prefixes_model_with_fast_icon_and_effort() {
+    fn details_prefixes_model_with_fast_icon_and_effort() {
         let mut session = sample_session();
         session.reasoning_effort = Some(crate::session::ReasoningEffort::XHigh);
         let config = PresenceConfig::default();
         let plan = resolved_plan_pro();
         let service_tier = resolved_service_tier(true);
-        let (_details, state) = presence_lines(
+        let (details, _state) = presence_lines(
             &session,
             Some(&session.limits),
             &plan,
             &service_tier,
             &config,
         );
-        assert!(state.contains("⚡ GPT-5.3-Codex XHigh"));
+        assert!(details.contains("⚡ GPT-5.3-Codex XHigh"));
     }
 
     #[test]
