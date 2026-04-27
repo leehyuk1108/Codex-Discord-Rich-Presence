@@ -7,7 +7,7 @@ use std::collections::HashSet;
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::config::{PresenceConfig, PresenceSurface};
-use crate::session::{CodexSessionSnapshot, RateLimits, ReasoningEffort, SessionActivityKind};
+use crate::session::{CodexSessionSnapshot, RateLimits, SessionActivityKind};
 use crate::telemetry::plan::ResolvedPlan;
 use crate::telemetry::service_tier::ResolvedServiceTier;
 use crate::util::{format_model_name, format_tokens};
@@ -41,6 +41,7 @@ const RECONNECT_MAX_BACKOFF: Duration = Duration::from_secs(60);
 struct PresencePayload {
     session_id: Option<String>,
     start_epoch: i64,
+    name: String,
     details: String,
     state: String,
 }
@@ -103,7 +104,7 @@ impl DiscordPresence {
         match active_session {
             Some(session) => {
                 self.idle_start_epoch = None;
-                let (details, state) = presence_lines(
+                let (name, details, state) = presence_lines(
                     session,
                     effective_limits,
                     resolved_plan,
@@ -114,6 +115,7 @@ impl DiscordPresence {
                 let payload = PresencePayload {
                     session_id: Some(session.session_id.clone()),
                     start_epoch,
+                    name: name.clone(),
                     details: details.clone(),
                     state: state.clone(),
                 };
@@ -146,6 +148,7 @@ impl DiscordPresence {
                 }
 
                 let activity = build_activity(
+                    &name,
                     &details,
                     &state,
                     start_epoch,
@@ -176,10 +179,11 @@ impl DiscordPresence {
                 let branding = display_branding(self.surface, config);
 
                 let details = branding.idle_details.to_string();
-                let state = "Waiting for session".to_string();
+                let state = "세션 대기 중".to_string();
                 let payload = PresencePayload {
                     session_id: None,
                     start_epoch: idle_start,
+                    name: details.clone(),
                     details: details.clone(),
                     state: state.clone(),
                 };
@@ -203,6 +207,7 @@ impl DiscordPresence {
                 }
 
                 let mut activity = Activity::new()
+                    .name(&details)
                     .details(&details)
                     .state(&state)
                     .timestamps(Timestamps::new().start(idle_start));
@@ -409,6 +414,7 @@ fn compact_error(input: &str) -> String {
 }
 
 fn build_activity<'a>(
+    name: &'a str,
     details: &'a str,
     state: &'a str,
     start_epoch: i64,
@@ -418,6 +424,7 @@ fn build_activity<'a>(
     small_text: Option<&'a str>,
 ) -> Activity<'a> {
     let mut activity = Activity::new()
+        .name(name)
         .details(details)
         .state(state)
         .timestamps(Timestamps::new().start(start_epoch));
@@ -475,13 +482,22 @@ fn presence_lines(
     session: &CodexSessionSnapshot,
     effective_limits: Option<&RateLimits>,
     _resolved_plan: &ResolvedPlan,
-    resolved_service_tier: &ResolvedServiceTier,
+    _resolved_service_tier: &ResolvedServiceTier,
     config: &PresenceConfig,
-) -> (String, String) {
+) -> (String, String, String) {
     if config.privacy.enabled {
-        return ("Using Codex".to_string(), "In a coding session".to_string());
+        return (
+            "Codex".to_string(),
+            "Codex 사용 중".to_string(),
+            "코딩 세션 중".to_string(),
+        );
     }
 
+    let surface_label = if session.is_desktop_surface() {
+        "Codex App"
+    } else {
+        "Codex"
+    };
     let project_label = if config.privacy.show_project_name {
         session.project_name.clone()
     } else {
@@ -501,25 +517,22 @@ fn presence_lines(
 
     let limits = effective_limits.unwrap_or(&session.limits);
 
-    let mut details_parts: Vec<String> = Vec::new();
-    if config.privacy.show_model
+    let name = if config.privacy.show_model
         && let Some(model) = &session.model
     {
-        let label = presence_model_display(
-            model,
-            session.reasoning_effort,
-            resolved_service_tier.is_fast(),
-        );
-        details_parts.push(truncate_for_limit(&label, 72));
-    }
-    if config.privacy.show_activity
+        let model_label = format_model_name(model);
+        format!("{surface_label} • {model_label}")
+    } else {
+        surface_label.to_string()
+    };
+
+    let details = if config.privacy.show_activity
         && let Some(activity) = &session.activity
     {
-        details_parts.push(activity_presence_text(
-            activity,
-            config.privacy.show_activity_target,
-        ));
-    }
+        activity_presence_text(activity, false)
+    } else {
+        project_fallback.clone()
+    };
 
     let mut state_parts: Vec<String> = Vec::new();
     let mut has_usage_summary = false;
@@ -541,40 +554,12 @@ fn presence_lines(
         state_parts.push(limits_part);
     }
 
-    let details = compact_join_prioritized(&details_parts, 128, &project_fallback, " • ");
     let state = compact_join_prioritized(&state_parts, 128, &project_fallback, " • ");
-    (truncate_for_limit(&details, 128), state)
-}
-
-fn presence_model_display(
-    model_id: &str,
-    reasoning_effort: Option<ReasoningEffort>,
-    fast_active: bool,
-) -> String {
-    let base = format_model_name(model_id);
-    let effort = reasoning_effort
-        .map(presence_effort_label)
-        .unwrap_or_default();
-    let label = if effort.is_empty() {
-        base
-    } else {
-        format!("{base} {effort}")
-    };
-    if fast_active {
-        format!("⚡ {label}")
-    } else {
-        label
-    }
-}
-
-fn presence_effort_label(effort: ReasoningEffort) -> &'static str {
-    match effort {
-        ReasoningEffort::Minimal => "최소",
-        ReasoningEffort::Low => "낮음",
-        ReasoningEffort::Medium => "보통",
-        ReasoningEffort::High => "높음",
-        ReasoningEffort::XHigh => "매우 높음",
-    }
+    (
+        truncate_for_limit(&name, 128),
+        truncate_for_limit(&details, 128),
+        state,
+    )
 }
 
 fn activity_presence_text(
@@ -603,7 +588,7 @@ fn activity_action_text_ko(kind: &SessionActivityKind) -> &'static str {
 
 fn context_state_part(session: &CodexSessionSnapshot) -> Option<String> {
     let context = session.context_window.as_ref()?;
-    Some(format!("컨텍스트 {:.0}%", context.remaining_percent))
+    Some(format!("CTX {:.0}%", context.remaining_percent))
 }
 
 fn cost_tokens_state_part(
@@ -918,12 +903,14 @@ mod tests {
         let old_payload = PresencePayload {
             session_id: Some("session-1".to_string()),
             start_epoch: 100,
+            name: "Codex App • GPT-5.3-Codex".to_string(),
             details: "Editing src/main.rs".to_string(),
             state: "GPT-5.3-Codex".to_string(),
         };
         let new_payload = PresencePayload {
             session_id: Some("session-1".to_string()),
             start_epoch: 120,
+            name: "Codex App • GPT-5.3-Codex".to_string(),
             details: "Editing src/main.rs".to_string(),
             state: "GPT-5.3-Codex".to_string(),
         };
@@ -948,15 +935,16 @@ mod tests {
         let config = PresenceConfig::default();
         let plan = resolved_plan_pro();
         let service_tier = resolved_service_tier(false);
-        let (details, state) = presence_lines(
+        let (name, details, state) = presence_lines(
             &session,
             Some(&session.limits),
             &plan,
             &service_tier,
             &config,
         );
-        assert_eq!(details, "GPT-5.3-Codex");
-        assert_eq!(state, "컨텍스트 94% • ₩1,822 / 30.0K 토큰");
+        assert_eq!(name, "Codex • GPT-5.3-Codex");
+        assert_eq!(details, "project-alpha • feature/main");
+        assert_eq!(state, "CTX 94% • ₩1,822 / 30.0K 토큰");
         assert!(state.contains('₩'));
         assert!(!state.contains('$'));
         assert!(state.contains("토큰"));
@@ -970,20 +958,20 @@ mod tests {
         let config = PresenceConfig::default();
         let plan = resolved_plan_pro();
         let service_tier = resolved_service_tier(false);
-        let (details, state) = presence_lines(
+        let (name, _details, state) = presence_lines(
             &session,
             Some(&session.limits),
             &plan,
             &service_tier,
             &config,
         );
-        let model_pos = details.find("GPT-5.3-Codex-Ultra-Long-Variant-Name-For-Tests");
-        assert!(model_pos.is_some(), "details must keep model summary");
+        let model_pos = name.find("GPT-5.3-Codex-Ultra-Long-Variant-Name-For-Tests");
+        assert!(model_pos.is_some(), "name must keep model summary");
         assert!(state.contains('₩'), "state should include cost summary");
     }
 
     #[test]
-    fn details_use_model_activity_format() {
+    fn details_use_activity_format() {
         let mut session = sample_session();
         session.activity = Some(crate::session::SessionActivitySnapshot {
             kind: crate::session::SessionActivityKind::RunningCommand,
@@ -997,14 +985,15 @@ mod tests {
         let config = PresenceConfig::default();
         let plan = resolved_plan_pro();
         let service_tier = resolved_service_tier(false);
-        let (details, _state) = presence_lines(
+        let (name, details, _state) = presence_lines(
             &session,
             Some(&session.limits),
             &plan,
             &service_tier,
             &config,
         );
-        assert_eq!(details, "GPT-5.3-Codex • 명령 실행 중 rg --files");
+        assert_eq!(name, "Codex • GPT-5.3-Codex");
+        assert_eq!(details, "명령 실행 중");
     }
 
     #[test]
@@ -1033,33 +1022,34 @@ mod tests {
         let config = PresenceConfig::default();
         let plan = resolved_plan_pro();
         let service_tier = resolved_service_tier(false);
-        let (details, state) = presence_lines(
+        let (name, details, state) = presence_lines(
             &session,
             Some(&session.limits),
             &plan,
             &service_tier,
             &config,
         );
-        assert_eq!(details, "GPT-5.3-Codex • 편집 중 main.rs");
+        assert_eq!(name, "Codex • GPT-5.3-Codex");
+        assert_eq!(details, "편집 중");
         assert!(!details.contains("Codex · project-alpha"));
-        assert!(state.contains("컨텍스트 94%"));
+        assert!(state.contains("CTX 94%"));
     }
 
     #[test]
-    fn details_prefixes_model_with_fast_icon_and_effort() {
+    fn name_uses_model_without_effort() {
         let mut session = sample_session();
         session.reasoning_effort = Some(crate::session::ReasoningEffort::XHigh);
         let config = PresenceConfig::default();
         let plan = resolved_plan_pro();
         let service_tier = resolved_service_tier(true);
-        let (details, _state) = presence_lines(
+        let (name, _details, _state) = presence_lines(
             &session,
             Some(&session.limits),
             &plan,
             &service_tier,
             &config,
         );
-        assert!(details.contains("⚡ GPT-5.3-Codex 매우 높음"));
+        assert_eq!(name, "Codex • GPT-5.3-Codex");
     }
 
     #[test]
