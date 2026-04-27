@@ -715,6 +715,7 @@ fn codex_desktop_app_is_running() -> bool {
     true
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn is_codex_desktop_main_process_args(line: &str) -> bool {
     line.ends_with("Codex.app/Contents/MacOS/Codex")
         || line.contains("Codex.app/Contents/MacOS/Codex ")
