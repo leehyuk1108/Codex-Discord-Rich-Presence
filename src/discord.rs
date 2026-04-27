@@ -10,7 +10,9 @@ use crate::config::{PresenceConfig, PresenceSurface};
 use crate::session::{CodexSessionSnapshot, RateLimits, ReasoningEffort, SessionActivityKind};
 use crate::telemetry::plan::ResolvedPlan;
 use crate::telemetry::service_tier::ResolvedServiceTier;
-use crate::util::{format_cost, format_model_name, format_tokens};
+use crate::util::{format_model_name, format_tokens};
+
+const USD_KRW_RATE: f64 = 1476.462523;
 
 pub struct DiscordPresence {
     surface: PresenceSurface,
@@ -567,11 +569,11 @@ fn presence_model_display(
 
 fn presence_effort_label(effort: ReasoningEffort) -> &'static str {
     match effort {
-        ReasoningEffort::Minimal => "Minimal",
-        ReasoningEffort::Low => "Low",
-        ReasoningEffort::Medium => "Medium",
-        ReasoningEffort::High => "High",
-        ReasoningEffort::XHigh => "XHigh",
+        ReasoningEffort::Minimal => "최소",
+        ReasoningEffort::Low => "낮음",
+        ReasoningEffort::Medium => "보통",
+        ReasoningEffort::High => "높음",
+        ReasoningEffort::XHigh => "매우 높음",
     }
 }
 
@@ -583,14 +585,25 @@ fn activity_presence_text(
         && let Some(target) = &activity.target
         && !target.trim().is_empty()
     {
-        return format!("{} {}", activity.action_text(), target);
+        return format!("{} {}", activity_action_text_ko(&activity.kind), target);
     }
-    activity.action_text().to_string()
+    activity_action_text_ko(&activity.kind).to_string()
+}
+
+fn activity_action_text_ko(kind: &SessionActivityKind) -> &'static str {
+    match kind {
+        SessionActivityKind::Thinking => "생각 중",
+        SessionActivityKind::ReadingFile => "읽는 중",
+        SessionActivityKind::EditingFile => "편집 중",
+        SessionActivityKind::RunningCommand => "명령 실행 중",
+        SessionActivityKind::WaitingInput => "입력 대기 중",
+        SessionActivityKind::Idle => "대기 중",
+    }
 }
 
 fn context_state_part(session: &CodexSessionSnapshot) -> Option<String> {
     let context = session.context_window.as_ref()?;
-    Some(format!("Ctx {:.0}%", context.remaining_percent))
+    Some(format!("컨텍스트 {:.0}%", context.remaining_percent))
 }
 
 fn cost_tokens_state_part(
@@ -599,13 +612,13 @@ fn cost_tokens_state_part(
 ) -> Option<String> {
     let mut parts = Vec::new();
     if config.privacy.show_cost && session.total_cost_usd > 0.0 {
-        parts.push(format_cost(session.total_cost_usd));
+        parts.push(format_krw_cost(session.total_cost_usd));
     }
     if config.privacy.show_tokens
         && let Some(total) = session.session_total_tokens
         && total > 0
     {
-        parts.push(format!("{} tok", format_tokens(total)));
+        parts.push(format!("{} 토큰", format_tokens(total)));
     }
     if parts.is_empty() {
         None
@@ -614,13 +627,33 @@ fn cost_tokens_state_part(
     }
 }
 
+fn format_krw_cost(cost_usd: f64) -> String {
+    if !cost_usd.is_finite() || cost_usd <= 0.0 {
+        return "₩0".to_string();
+    }
+    let krw = (cost_usd * USD_KRW_RATE).round() as u64;
+    format!("₩{}", format_with_commas(krw))
+}
+
+fn format_with_commas(value: u64) -> String {
+    let digits = value.to_string();
+    let mut formatted = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, ch) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index) % 3 == 0 {
+            formatted.push(',');
+        }
+        formatted.push(ch);
+    }
+    formatted
+}
+
 fn limits_state_part(limits: &RateLimits) -> Option<String> {
     let mut parts = Vec::new();
     if let Some(primary) = &limits.primary {
-        parts.push(format!("5h {:.0}%", primary.remaining_percent));
+        parts.push(format!("5시간 {:.0}%", primary.remaining_percent));
     }
     if let Some(secondary) = &limits.secondary {
-        parts.push(format!("7d {:.0}%", secondary.remaining_percent));
+        parts.push(format!("7일 {:.0}%", secondary.remaining_percent));
     }
     if parts.is_empty() {
         None
@@ -923,10 +956,11 @@ mod tests {
             &config,
         );
         assert_eq!(details, "GPT-5.3-Codex");
-        assert_eq!(state, "Ctx 94% • $1.23 / 30.0K tok");
-        assert!(state.contains('$'));
-        assert!(state.contains("tok"));
-        assert!(!state.contains("5h"));
+        assert_eq!(state, "컨텍스트 94% • ₩1,822 / 30.0K 토큰");
+        assert!(state.contains('₩'));
+        assert!(!state.contains('$'));
+        assert!(state.contains("토큰"));
+        assert!(!state.contains("5시간"));
     }
 
     #[test]
@@ -945,7 +979,7 @@ mod tests {
         );
         let model_pos = details.find("GPT-5.3-Codex-Ultra-Long-Variant-Name-For-Tests");
         assert!(model_pos.is_some(), "details must keep model summary");
-        assert!(state.contains('$'), "state should include cost summary");
+        assert!(state.contains('₩'), "state should include cost summary");
     }
 
     #[test]
@@ -970,7 +1004,7 @@ mod tests {
             &service_tier,
             &config,
         );
-        assert_eq!(details, "GPT-5.3-Codex • Running command rg --files");
+        assert_eq!(details, "GPT-5.3-Codex • 명령 실행 중 rg --files");
     }
 
     #[test]
@@ -1006,9 +1040,9 @@ mod tests {
             &service_tier,
             &config,
         );
-        assert_eq!(details, "GPT-5.3-Codex • Editing main.rs");
+        assert_eq!(details, "GPT-5.3-Codex • 편집 중 main.rs");
         assert!(!details.contains("Codex · project-alpha"));
-        assert!(state.contains("Ctx 94%"));
+        assert!(state.contains("컨텍스트 94%"));
     }
 
     #[test]
@@ -1025,7 +1059,7 @@ mod tests {
             &service_tier,
             &config,
         );
-        assert!(details.contains("⚡ GPT-5.3-Codex XHigh"));
+        assert!(details.contains("⚡ GPT-5.3-Codex 매우 높음"));
     }
 
     #[test]
