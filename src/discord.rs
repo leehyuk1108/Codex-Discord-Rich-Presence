@@ -511,8 +511,11 @@ fn presence_lines(
     if config.privacy.show_model
         && let Some(model) = &session.model
     {
-        let label =
-            format_model_display(model, session.reasoning_effort, resolved_service_tier.is_fast());
+        let label = format_model_display(
+            model,
+            session.reasoning_effort,
+            resolved_service_tier.is_fast(),
+        );
         state_parts.push(truncate_for_limit(&label, 72));
     }
     if !matches!(resolved_plan.tier, DetectedPlanTier::Unknown) {

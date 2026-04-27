@@ -243,6 +243,7 @@ fn run_foreground_tui(mut config: PresenceConfig, runtime: RuntimeSettings) -> R
     let mut force_redraw = true;
     let mut plan_picker_open = false;
     let mut plan_picker_selected = plan_preset_index(&config.openai_plan);
+    let mut follow_codex_app_lifecycle = false;
 
     ui::enter_terminal()?;
 
@@ -262,6 +263,10 @@ fn run_foreground_tui(mut config: PresenceConfig, runtime: RuntimeSettings) -> R
                     &mut metrics_tracker,
                     &mut plan_detector,
                 )?;
+                if should_shutdown_for_closed_codex_app(&snapshot, &mut follow_codex_app_lifecycle)
+                {
+                    break;
+                }
                 publish_runtime_snapshot(&mut discord, &snapshot, &config);
 
                 let active = snapshot.active_session();
@@ -453,6 +458,7 @@ fn run_headless_foreground(
     let mut metrics_tracker = MetricsTracker::new();
     let mut plan_detector = PlanDetector::new();
     let sessions_roots = config::sessions_paths();
+    let mut follow_codex_app_lifecycle = false;
     println!("No interactive terminal detected; running in headless foreground mode.");
     println!("Press Ctrl+C to stop.");
 
@@ -466,6 +472,9 @@ fn run_headless_foreground(
             &mut metrics_tracker,
             &mut plan_detector,
         )?;
+        if should_shutdown_for_closed_codex_app(&snapshot, &mut follow_codex_app_lifecycle) {
+            break;
+        }
         publish_runtime_snapshot(&mut discord, &snapshot, &config);
         thread::sleep(runtime.poll_interval);
     }
@@ -667,6 +676,48 @@ fn run_codex_wrapper(
 
     discord.shutdown();
     Ok(())
+}
+
+fn should_shutdown_for_closed_codex_app(
+    snapshot: &RuntimeSnapshot,
+    follow_codex_app_lifecycle: &mut bool,
+) -> bool {
+    if snapshot
+        .sessions
+        .iter()
+        .any(CodexSessionSnapshot::is_desktop_surface)
+    {
+        *follow_codex_app_lifecycle = true;
+    }
+
+    *follow_codex_app_lifecycle && !codex_desktop_app_is_running()
+}
+
+#[cfg(target_os = "macos")]
+fn codex_desktop_app_is_running() -> bool {
+    let Ok(output) = Command::new("ps")
+        .arg("-axo")
+        .arg("args=")
+        .stderr(Stdio::null())
+        .output()
+    else {
+        return false;
+    };
+
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .any(is_codex_desktop_main_process_args)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn codex_desktop_app_is_running() -> bool {
+    true
+}
+
+fn is_codex_desktop_main_process_args(line: &str) -> bool {
+    line.ends_with("Codex.app/Contents/MacOS/Codex")
+        || line.contains("Codex.app/Contents/MacOS/Codex ")
 }
 
 fn spawn_codex_child(args: Vec<String>) -> Result<Child> {
@@ -908,4 +959,25 @@ fn is_plan_picker_toggle_key(key: &KeyEvent) -> bool {
 fn request_redraw(force_redraw: &mut bool, last_tick: &mut Instant, poll_interval: Duration) {
     *force_redraw = true;
     *last_tick = Instant::now() - poll_interval;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_codex_desktop_main_process_args;
+
+    #[test]
+    fn codex_app_process_matcher_targets_only_main_app_process() {
+        assert!(is_codex_desktop_main_process_args(
+            "/Applications/Codex.app/Contents/MacOS/Codex"
+        ));
+        assert!(is_codex_desktop_main_process_args(
+            "/Applications/Codex.app/Contents/MacOS/Codex --some-future-flag"
+        ));
+        assert!(!is_codex_desktop_main_process_args(
+            "/Applications/Codex.app/Contents/Frameworks/Codex Helper.app/Contents/MacOS/Codex Helper"
+        ));
+        assert!(!is_codex_desktop_main_process_args(
+            "/Applications/Codex.app/Contents/Resources/node_repl"
+        ));
+    }
 }
