@@ -536,12 +536,6 @@ fn presence_lines(
 
     let mut state_parts: Vec<String> = Vec::new();
     let mut has_usage_summary = false;
-    if config.privacy.show_tokens
-        && let Some(context) = context_state_part(session)
-    {
-        state_parts.push(context);
-        has_usage_summary = true;
-    }
     if let Some(cost_tokens) = cost_tokens_state_part(session, config) {
         state_parts.push(cost_tokens);
         has_usage_summary = true;
@@ -584,11 +578,6 @@ fn activity_action_text_ko(kind: &SessionActivityKind) -> &'static str {
         SessionActivityKind::WaitingInput => "입력 대기 중",
         SessionActivityKind::Idle => "대기 중",
     }
-}
-
-fn context_state_part(session: &CodexSessionSnapshot) -> Option<String> {
-    let context = session.context_window.as_ref()?;
-    Some(format!("CTX {:.0}%", context.remaining_percent))
 }
 
 fn cost_tokens_state_part(
@@ -944,7 +933,7 @@ mod tests {
         );
         assert_eq!(name, "Codex • GPT-5.3-Codex");
         assert_eq!(details, "project-alpha • feature/main");
-        assert_eq!(state, "CTX 94% • ₩1,822 / 30.0K 토큰");
+        assert_eq!(state, "₩1,822 / 30.0K 토큰");
         assert!(state.contains('₩'));
         assert!(!state.contains('$'));
         assert!(state.contains("토큰"));
@@ -1032,7 +1021,8 @@ mod tests {
         assert_eq!(name, "Codex • GPT-5.3-Codex");
         assert_eq!(details, "편집 중");
         assert!(!details.contains("Codex · project-alpha"));
-        assert!(state.contains("CTX 94%"));
+        assert!(!state.contains("CTX"));
+        assert!(state.contains("30.0K 토큰"));
     }
 
     #[test]
