@@ -399,17 +399,15 @@ impl SessionAccumulator {
                         event_timestamp,
                     );
                 }
-                Some("message") => {
-                    if str_at(payload, &["role"]).as_deref() == Some("assistant") {
-                        if str_at(payload, &["phase"]).as_deref() == Some("commentary") {
-                            self.activity_tracker.note_commentary(event_timestamp);
-                        } else {
-                            self.activity_tracker.mark_activity(
-                                SessionActivityKind::WaitingInput,
-                                None,
-                                event_timestamp,
-                            );
-                        }
+                Some("message") if str_at(payload, &["role"]).as_deref() == Some("assistant") => {
+                    if str_at(payload, &["phase"]).as_deref() == Some("commentary") {
+                        self.activity_tracker.note_commentary(event_timestamp);
+                    } else {
+                        self.activity_tracker.mark_activity(
+                            SessionActivityKind::WaitingInput,
+                            None,
+                            event_timestamp,
+                        );
                     }
                 }
                 _ => {}

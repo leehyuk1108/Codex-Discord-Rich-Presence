@@ -152,10 +152,12 @@ impl DiscordPresence {
                     &details,
                     &state,
                     start_epoch,
-                    large_image_key.as_deref(),
-                    non_empty_trimmed(branding.large_text),
-                    small_image_key.as_deref(),
-                    non_empty_trimmed(&small_text),
+                    ActivityAssetOptions {
+                        large_image_key: large_image_key.as_deref(),
+                        large_text: non_empty_trimmed(branding.large_text),
+                        small_image_key: small_image_key.as_deref(),
+                        small_text: non_empty_trimmed(&small_text),
+                    },
                 );
                 let client = self
                     .client
@@ -413,15 +415,19 @@ fn compact_error(input: &str) -> String {
     truncate_for_limit(input, 96)
 }
 
+struct ActivityAssetOptions<'a> {
+    large_image_key: Option<&'a str>,
+    large_text: Option<&'a str>,
+    small_image_key: Option<&'a str>,
+    small_text: Option<&'a str>,
+}
+
 fn build_activity<'a>(
     name: &'a str,
     details: &'a str,
     state: &'a str,
     start_epoch: i64,
-    large_image_key: Option<&'a str>,
-    large_text: Option<&'a str>,
-    small_image_key: Option<&'a str>,
-    small_text: Option<&'a str>,
+    asset_options: ActivityAssetOptions<'a>,
 ) -> Activity<'a> {
     let mut activity = Activity::new()
         .name(name)
@@ -432,18 +438,18 @@ fn build_activity<'a>(
     let mut assets = Assets::new();
     let mut has_assets = false;
 
-    if let Some(image_key) = large_image_key {
+    if let Some(image_key) = asset_options.large_image_key {
         assets = assets.large_image(image_key);
         has_assets = true;
-        if let Some(text) = large_text {
+        if let Some(text) = asset_options.large_text {
             assets = assets.large_text(text);
         }
     }
 
-    if let Some(image_key) = small_image_key {
+    if let Some(image_key) = asset_options.small_image_key {
         assets = assets.small_image(image_key);
         has_assets = true;
-        if let Some(text) = small_text {
+        if let Some(text) = asset_options.small_text {
             assets = assets.small_text(text);
         }
     }
@@ -613,7 +619,7 @@ fn format_with_commas(value: u64) -> String {
     let digits = value.to_string();
     let mut formatted = String::with_capacity(digits.len() + digits.len() / 3);
     for (index, ch) in digits.chars().enumerate() {
-        if index > 0 && (digits.len() - index) % 3 == 0 {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
             formatted.push(',');
         }
         formatted.push(ch);
