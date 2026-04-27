@@ -18,6 +18,31 @@
 
 > Local-first by design: the runtime reads your Codex session files on disk, talks to Discord over local IPC. Nothing is stored in the cloud.
 
+## 이 포크에서 바뀐 점
+
+이 저장소는 원본 `Codex-Discord-Rich-Presence`를 Codex App 중심으로 다듬은 개인 포크입니다. 원본의 기본 기능은 유지하되, macOS Codex App에서 더 자연스럽게 보이도록 Discord 표시 방식과 실행 방식을 바꿨습니다.
+
+현재 Discord 표시는 아래처럼 간결한 3줄 구성을 목표로 합니다.
+
+```text
+Codex App • GPT-5.5
+명령 실행 중
+₩12,047 / 44.5M 토큰
+```
+
+주요 변경점은 다음과 같습니다.
+
+- Codex App 세션을 우선 지원하도록 데스크톱 surface 감지와 Discord 표시 문구를 정리했습니다.
+- Discord presence를 한국어 중심으로 바꿨습니다. 예: `명령 실행 중`, `편집 중`, `입력 대기 중`, `토큰`.
+- 모델 표시가 오래된 값에 머무르지 않도록 최신 `turn_context` 모델을 우선 반영합니다. 예: 실제 세션이 GPT-5.5면 GPT-5.5로 표시됩니다.
+- Discord 첫 줄을 `Codex App • GPT-5.5`처럼 보이도록 Rich Presence의 activity name을 사용합니다.
+- 비용 표시는 달러 대신 원화로 환산해 표시합니다. 현재 기준 환율은 `1 USD = 1,476.462523 KRW`입니다.
+- 비용/토큰 줄에서 context 표시는 제거하고, `₩... / ... 토큰`만 남겼습니다.
+- 한국어 파일명이나 긴 activity target이 들어와도 UTF-8 경계에서 안전하게 잘리도록 수정했습니다.
+- Codex App이 종료되면 presence도 함께 정리되도록 Codex App lifecycle 감지를 추가했습니다.
+- macOS에서는 LaunchAgent로 등록해 터미널 창 없이 백그라운드에서 실행할 수 있습니다. 예: `~/Library/LaunchAgents/com.leehyuk.codex-discord-presence.plist`.
+- 현재 작업 폴더가 git repo가 아니어도 하위 repo가 하나뿐이면 그 branch를 표시할 수 있도록 보강했습니다.
+
 ## Overview
 
 Codex Discord Rich Presence reads local Codex session telemetry, detects the active Codex surface, renders a live terminal dashboard, and publishes a clean Discord presence with activity, model, Fast mode, reasoning effort, account plan, token usage, cost, context window, and quota visibility.
