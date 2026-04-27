@@ -535,7 +535,7 @@ fn presence_lines(
     let details = if config.privacy.show_activity
         && let Some(activity) = &session.activity
     {
-        activity_presence_text(activity, false)
+        activity_presence_text(activity, true)
     } else {
         project_fallback.clone()
     };
@@ -578,7 +578,7 @@ fn activity_presence_text(
 fn activity_action_text_ko(kind: &SessionActivityKind) -> &'static str {
     match kind {
         SessionActivityKind::Thinking => "생각 중",
-        SessionActivityKind::ReadingFile => "읽는 중",
+        SessionActivityKind::ReadingFile => "검토 중",
         SessionActivityKind::EditingFile => "편집 중",
         SessionActivityKind::RunningCommand => "명령 실행 중",
         SessionActivityKind::WaitingInput => "입력 대기 중",
@@ -988,7 +988,32 @@ mod tests {
             &config,
         );
         assert_eq!(name, "Codex • GPT-5.3-Codex");
-        assert_eq!(details, "명령 실행 중");
+        assert_eq!(details, "명령 실행 중 rg --files");
+    }
+
+    #[test]
+    fn reading_activity_details_show_review_target() {
+        let mut session = sample_session();
+        session.activity = Some(crate::session::SessionActivitySnapshot {
+            kind: crate::session::SessionActivityKind::ReadingFile,
+            target: Some("src/discord.rs".to_string()),
+            observed_at: None,
+            last_active_at: None,
+            last_effective_signal_at: None,
+            idle_candidate_at: None,
+            pending_calls: 0,
+        });
+        let config = PresenceConfig::default();
+        let plan = resolved_plan_pro();
+        let service_tier = resolved_service_tier(false);
+        let (_name, details, _state) = presence_lines(
+            &session,
+            Some(&session.limits),
+            &plan,
+            &service_tier,
+            &config,
+        );
+        assert_eq!(details, "검토 중 src/discord.rs");
     }
 
     #[test]
@@ -1025,7 +1050,7 @@ mod tests {
             &config,
         );
         assert_eq!(name, "Codex • GPT-5.3-Codex");
-        assert_eq!(details, "편집 중");
+        assert_eq!(details, "편집 중 main.rs");
         assert!(!details.contains("Codex · project-alpha"));
         assert!(!state.contains("CTX"));
         assert!(state.contains("30.0K 토큰"));
