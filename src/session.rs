@@ -785,6 +785,15 @@ mod tests {
     }
 
     #[test]
+    fn latest_turn_context_model_wins() {
+        let snapshot = parse_one(
+            r#"{"timestamp":"2026-02-23T03:40:38Z","type":"turn_context","payload":{"cwd":"C:\\repo\\app","model":"gpt-5.4","effort":"xhigh"}}
+{"timestamp":"2026-02-23T03:41:38Z","type":"turn_context","payload":{"cwd":"C:\\repo\\app","model":"gpt-5.5","effort":"xhigh"}}"#,
+        );
+        assert_eq!(snapshot.model.as_deref(), Some("gpt-5.5"));
+    }
+
+    #[test]
     fn falls_back_to_nested_turn_context_reasoning_effort() {
         let snapshot = parse_one(
             r#"{"timestamp":"2026-02-23T03:40:38Z","type":"turn_context","payload":{"cwd":"C:\\repo\\app","model":"gpt-5.4","collaboration_mode":{"mode":"default","settings":{"reasoning_effort":"high"}}}}"#,

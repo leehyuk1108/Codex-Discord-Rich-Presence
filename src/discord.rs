@@ -8,9 +8,9 @@ use std::time::{Duration, Instant, SystemTime};
 
 use crate::config::{PresenceConfig, PresenceSurface};
 use crate::session::{CodexSessionSnapshot, RateLimits, SessionActivityKind};
-use crate::telemetry::plan::ResolvedPlan;
+use crate::telemetry::plan::{DetectedPlanTier, ResolvedPlan};
 use crate::telemetry::service_tier::ResolvedServiceTier;
-use crate::util::{format_cost, format_model_display, format_tokens};
+use crate::util::format_model_display;
 
 pub struct DiscordPresence {
     surface: PresenceSurface,
@@ -480,6 +480,11 @@ fn presence_lines(
         return ("Using Codex".to_string(), "In a coding session".to_string());
     }
 
+    let surface_label = if session.is_desktop_surface() {
+        "Codex App"
+    } else {
+        "Codex"
+    };
     let project_label = if config.privacy.show_project_name {
         if config.privacy.show_git_branch {
             if let Some(branch) = &session.git_branch {
@@ -494,22 +499,10 @@ fn presence_lines(
         "private project".to_string()
     };
 
-    let details = if config.privacy.show_activity {
-        if let Some(activity) = &session.activity {
-            format!(
-                "{} - {}",
-                activity.to_text(config.privacy.show_activity_target),
-                project_label
-            )
-        } else if config.privacy.show_project_name {
-            format!("In {}", project_label)
-        } else {
-            "Coding session".to_string()
-        }
-    } else if config.privacy.show_project_name {
-        format!("In {}", project_label)
+    let details = if config.privacy.show_project_name {
+        format!("{surface_label} · {project_label}")
     } else {
-        "Coding session".to_string()
+        surface_label.to_string()
     };
 
     let limits = effective_limits.unwrap_or(&session.limits);
@@ -518,24 +511,26 @@ fn presence_lines(
     if config.privacy.show_model
         && let Some(model) = &session.model
     {
-        let label = format!(
-            "{} | {}",
-            format_model_display(
-                model,
-                session.reasoning_effort,
-                resolved_service_tier.is_fast()
-            ),
-            resolved_plan.label(config.openai_plan.show_price)
-        );
-        state_parts.push(truncate_for_limit(&label, 68));
+        let label =
+            format_model_display(model, session.reasoning_effort, resolved_service_tier.is_fast());
+        state_parts.push(truncate_for_limit(&label, 72));
     }
-    if config.privacy.show_cost && session.total_cost_usd > 0.0 {
-        state_parts.push(format_cost(session.total_cost_usd));
+    if !matches!(resolved_plan.tier, DetectedPlanTier::Unknown) {
+        state_parts.push(resolved_plan.label(false));
     }
-    if let Some(usage) = usage_state_part(session, config.privacy.show_tokens) {
-        state_parts.push(usage);
+    if config.privacy.show_activity
+        && let Some(activity) = &session.activity
+    {
+        state_parts.push(activity.action_text().to_string());
     }
-    if config.privacy.show_limits
+    if state_parts.len() < 2
+        && config.privacy.show_tokens
+        && let Some(context) = context_state_part(session)
+    {
+        state_parts.push(context);
+    }
+    if state_parts.len() < 2
+        && config.privacy.show_limits
         && let Some(limits_part) = limits_state_part(limits)
     {
         state_parts.push(limits_part);
@@ -546,47 +541,13 @@ fn presence_lines(
     } else {
         "Codex session"
     };
-    let state = compact_join_prioritized(&state_parts, 128, fallback, " • ");
+    let state = compact_join_prioritized(&state_parts, 128, fallback, " · ");
     (truncate_for_limit(&details, 128), state)
-}
-
-fn token_state_part(session: &CodexSessionSnapshot) -> Option<String> {
-    if let Some(total) = session.session_total_tokens
-        && total > 0
-    {
-        return Some(format!("{} tok", format_tokens(total)));
-    }
-    if let Some(last) = session.last_turn_tokens
-        && last > 0
-    {
-        return Some(format!("Last {}", format_tokens(last)));
-    }
-    if let Some(delta) = session.session_delta_tokens
-        && delta > 0
-    {
-        return Some(format!("+{}", format_tokens(delta)));
-    }
-    None
 }
 
 fn context_state_part(session: &CodexSessionSnapshot) -> Option<String> {
     let context = session.context_window.as_ref()?;
     Some(format!("Ctx {:.0}%", context.remaining_percent))
-}
-
-fn usage_state_part(session: &CodexSessionSnapshot, show_tokens: bool) -> Option<String> {
-    let mut parts = Vec::new();
-    if show_tokens && let Some(tokens) = token_state_part(session) {
-        parts.push(tokens);
-    }
-    if let Some(context) = context_state_part(session) {
-        parts.push(context);
-    }
-    if parts.is_empty() {
-        None
-    } else {
-        Some(parts.join(" • "))
-    }
 }
 
 fn limits_state_part(limits: &RateLimits) -> Option<String> {
@@ -627,8 +588,7 @@ fn small_asset_for_activity(
     .filter(|value| !value.is_empty())
     .unwrap_or(fallback_key);
 
-    let mapped_text =
-        truncate_for_limit(&activity.to_text(config.privacy.show_activity_target), 128);
+    let mapped_text = truncate_for_limit(activity.action_text(), 128);
     (mapped_key, mapped_text)
 }
 
@@ -886,7 +846,7 @@ mod tests {
     }
 
     #[test]
-    fn state_uses_remaining_limits_and_cost_tokens() {
+    fn state_uses_compact_model_plan_summary() {
         let session = sample_session();
         let config = PresenceConfig::default();
         let plan = resolved_plan_pro();
@@ -898,12 +858,10 @@ mod tests {
             &service_tier,
             &config,
         );
-        assert!(state.contains("GPT-5.3-Codex | Pro ($200/month)"));
-        assert!(state.contains(format_cost(session.total_cost_usd).as_str()));
-        assert!(state.contains("30.0K tok"));
-        assert!(state.contains("Ctx 94%"));
-        assert!(state.contains("5h 64%"));
-        assert!(state.contains("7d 18%"));
+        assert_eq!(state, "GPT-5.3-Codex · Pro");
+        assert!(!state.contains('$'));
+        assert!(!state.contains("tok"));
+        assert!(!state.contains("5h"));
     }
 
     #[test]
@@ -920,14 +878,13 @@ mod tests {
             &service_tier,
             &config,
         );
-        let model_pos = state.find("GPT-5.3-Codex-Ultra-Long-Variant-Name-For-Tests | Pro");
-        let cost_pos = state.find('$');
+        let model_pos = state.find("GPT-5.3-Codex-Ultra-Long-Variant-Name-For-Tests");
         assert!(model_pos.is_some(), "state must keep model+plan");
-        assert!(cost_pos.is_some(), "state must keep cost");
+        assert!(!state.contains('$'), "state should stay visually compact");
     }
 
     #[test]
-    fn details_use_activity_dash_project_format() {
+    fn details_use_surface_project_format() {
         let mut session = sample_session();
         session.activity = Some(crate::session::SessionActivitySnapshot {
             kind: crate::session::SessionActivityKind::RunningCommand,
@@ -948,10 +905,7 @@ mod tests {
             &service_tier,
             &config,
         );
-        assert_eq!(
-            details,
-            "Running command rg --files - project-alpha (feature/main)"
-        );
+        assert_eq!(details, "Codex · project-alpha (feature/main)");
     }
 
     #[test]
@@ -987,9 +941,9 @@ mod tests {
             &service_tier,
             &config,
         );
-        assert!(details.starts_with("Editing"));
-        assert!(details.contains("project-alpha"));
+        assert_eq!(details, "Codex · project-alpha (feature/main)");
         assert!(state.contains("GPT-5.3-Codex"));
+        assert!(state.contains("Editing"));
     }
 
     #[test]
@@ -1006,7 +960,7 @@ mod tests {
             &service_tier,
             &config,
         );
-        assert!(state.contains("⚡ GPT-5.3-Codex (Extra High) | Pro ($200/month)"));
+        assert!(state.contains("⚡ GPT-5.3-Codex (Extra High) · Pro"));
     }
 
     #[test]

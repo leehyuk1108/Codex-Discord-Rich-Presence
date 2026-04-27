@@ -12,6 +12,7 @@ use crate::telemetry::limits::{
     RateLimitEnvelope, RateLimits, limits_present as telemetry_limits_present,
     parse_rate_limit_envelope, select_session_envelope_global_first,
 };
+use crate::util::truncate;
 
 use super::is_working_activity_kind;
 use super::parser::{
@@ -264,8 +265,10 @@ impl SessionAccumulator {
                 if self.cwd.is_none() {
                     self.cwd = str_at(payload, &["cwd"]).map(PathBuf::from);
                 }
-                if self.model.is_none() {
-                    self.model = str_at(payload, &["model"]);
+                if let Some(model) = str_at(payload, &["model"])
+                    .or_else(|| str_at(payload, &["collaboration_mode", "settings", "model"]))
+                {
+                    self.model = Some(model);
                 }
                 if let Some(reasoning_effort) = turn_context_reasoning_effort(payload) {
                     self.reasoning_effort = Some(reasoning_effort);
@@ -842,13 +845,7 @@ fn extract_patch_target(input: &str) -> Option<String> {
 }
 
 fn truncate_activity_target(input: String, max_len: usize) -> String {
-    if input.len() <= max_len {
-        return input;
-    }
-    if max_len <= 3 {
-        return input[..max_len].to_string();
-    }
-    format!("{}...", &input[..max_len - 3])
+    truncate(&input, max_len)
 }
 
 fn sanitize_file_target(raw: &str, max_len: usize) -> String {
@@ -869,4 +866,19 @@ fn sanitize_file_target(raw: &str, max_len: usize) -> String {
     }
 
     truncate_activity_target(cleaned.to_string(), max_len)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::truncate_activity_target;
+
+    #[test]
+    fn truncate_activity_target_is_utf8_safe() {
+        let target = "area|휴게소|toll|ic|JC|톨게이트|interchange|TG|SA|나들목|분기점|IC|JC";
+
+        assert_eq!(
+            truncate_activity_target(target.to_string(), 72),
+            "area|휴게소|toll|ic|JC|톨게이트|interchange|TG|SA|나들목|..."
+        );
+    }
 }
