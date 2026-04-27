@@ -7,6 +7,7 @@ use std::time::SystemTime;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde_json::Value;
+use walkdir::WalkDir;
 
 use crate::config::PricingConfig;
 use crate::cost;
@@ -240,6 +241,10 @@ pub(super) fn parse_utc_timestamp(text: String) -> Option<DateTime<Utc>> {
 }
 
 pub(super) fn fetch_git_branch(project_path: &Path) -> Option<String> {
+    fetch_git_branch_at(project_path).or_else(|| fetch_single_nested_git_branch(project_path))
+}
+
+fn fetch_git_branch_at(project_path: &Path) -> Option<String> {
     let output = Command::new("git")
         .arg("-C")
         .arg(project_path)
@@ -250,7 +255,7 @@ pub(super) fn fetch_git_branch(project_path: &Path) -> Option<String> {
         .ok()?;
 
     if !output.status.success() {
-        return None;
+        return fetch_symbolic_git_branch(project_path);
     }
 
     let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -272,6 +277,45 @@ pub(super) fn fetch_git_branch(project_path: &Path) -> Option<String> {
     (!branch.is_empty()).then_some(branch)
 }
 
+fn fetch_symbolic_git_branch(project_path: &Path) -> Option<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(project_path)
+        .arg("symbolic-ref")
+        .arg("--quiet")
+        .arg("--short")
+        .arg("HEAD")
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!branch.is_empty()).then_some(branch)
+}
+
+fn fetch_single_nested_git_branch(project_path: &Path) -> Option<String> {
+    if !project_path.is_dir() {
+        return None;
+    }
+
+    let mut repos = WalkDir::new(project_path)
+        .min_depth(1)
+        .max_depth(4)
+        .into_iter()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_name() == ".git")
+        .filter_map(|entry| entry.path().parent().map(Path::to_path_buf));
+
+    let repo = repos.next()?;
+    if repos.next().is_some() {
+        return None;
+    }
+    fetch_git_branch_at(&repo)
+}
+
 pub(super) fn str_at(value: &Value, path: &[&str]) -> Option<String> {
     let mut cursor = value;
     for key in path {
@@ -288,4 +332,48 @@ pub(super) fn uint_at(value: &Value, path: &[&str]) -> Option<u64> {
     cursor
         .as_u64()
         .or_else(|| cursor.as_i64().and_then(|n| (n >= 0).then_some(n as u64)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    fn init_git_repo(path: &Path) {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .arg("init")
+            .arg("-b")
+            .arg("main")
+            .output()
+            .expect("run git init");
+        assert!(
+            output.status.success(),
+            "git init failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn fetch_git_branch_uses_single_nested_repo_when_cwd_is_not_git() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let repo = root.path().join("nested");
+        fs::create_dir(&repo).expect("create nested repo dir");
+        init_git_repo(&repo);
+
+        assert_eq!(fetch_git_branch(root.path()).as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn fetch_git_branch_ignores_ambiguous_nested_repos() {
+        let root = tempfile::tempdir().expect("tempdir");
+        for name in ["one", "two"] {
+            let repo = root.path().join(name);
+            fs::create_dir(&repo).expect("create nested repo dir");
+            init_git_repo(&repo);
+        }
+
+        assert_eq!(fetch_git_branch(root.path()), None);
+    }
 }

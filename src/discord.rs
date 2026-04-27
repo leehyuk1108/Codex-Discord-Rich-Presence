@@ -7,10 +7,10 @@ use std::collections::HashSet;
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::config::{PresenceConfig, PresenceSurface};
-use crate::session::{CodexSessionSnapshot, RateLimits, SessionActivityKind};
-use crate::telemetry::plan::{DetectedPlanTier, ResolvedPlan};
+use crate::session::{CodexSessionSnapshot, RateLimits, ReasoningEffort, SessionActivityKind};
+use crate::telemetry::plan::ResolvedPlan;
 use crate::telemetry::service_tier::ResolvedServiceTier;
-use crate::util::format_model_display;
+use crate::util::{format_cost, format_model_name, format_tokens};
 
 pub struct DiscordPresence {
     surface: PresenceSurface,
@@ -472,7 +472,7 @@ fn system_time_to_epoch(value: SystemTime) -> Option<i64> {
 fn presence_lines(
     session: &CodexSessionSnapshot,
     effective_limits: Option<&RateLimits>,
-    resolved_plan: &ResolvedPlan,
+    _resolved_plan: &ResolvedPlan,
     resolved_service_tier: &ResolvedServiceTier,
     config: &PresenceConfig,
 ) -> (String, String) {
@@ -486,21 +486,19 @@ fn presence_lines(
         "Codex"
     };
     let project_label = if config.privacy.show_project_name {
-        if config.privacy.show_git_branch {
-            if let Some(branch) = &session.git_branch {
-                format!("{} ({branch})", session.project_name)
-            } else {
-                session.project_name.clone()
-            }
-        } else {
-            session.project_name.clone()
-        }
+        session.project_name.clone()
     } else {
         "private project".to_string()
     };
 
     let details = if config.privacy.show_project_name {
-        format!("{surface_label} · {project_label}")
+        let mut details_parts = vec![surface_label.to_string(), project_label.clone()];
+        if config.privacy.show_git_branch
+            && let Some(branch) = &session.git_branch
+        {
+            details_parts.push(branch.clone());
+        }
+        details_parts.join(" · ")
     } else {
         surface_label.to_string()
     };
@@ -511,28 +509,34 @@ fn presence_lines(
     if config.privacy.show_model
         && let Some(model) = &session.model
     {
-        let label = format_model_display(
+        let label = presence_model_display(
             model,
             session.reasoning_effort,
             resolved_service_tier.is_fast(),
         );
         state_parts.push(truncate_for_limit(&label, 72));
     }
-    if !matches!(resolved_plan.tier, DetectedPlanTier::Unknown) {
-        state_parts.push(resolved_plan.label(false));
-    }
     if config.privacy.show_activity
         && let Some(activity) = &session.activity
     {
-        state_parts.push(activity.action_text().to_string());
+        state_parts.push(activity_presence_text(
+            activity,
+            config.privacy.show_activity_target,
+        ));
     }
-    if state_parts.len() < 2
-        && config.privacy.show_tokens
+    let mut has_usage_summary = false;
+    if config.privacy.show_tokens
         && let Some(context) = context_state_part(session)
     {
         state_parts.push(context);
+        has_usage_summary = true;
     }
-    if state_parts.len() < 2
+    if let Some(cost_tokens) = cost_tokens_state_part(session, config) {
+        state_parts.push(cost_tokens);
+        has_usage_summary = true;
+    }
+    if !has_usage_summary
+        && state_parts.len() < 4
         && config.privacy.show_limits
         && let Some(limits_part) = limits_state_part(limits)
     {
@@ -548,9 +552,74 @@ fn presence_lines(
     (truncate_for_limit(&details, 128), state)
 }
 
+fn presence_model_display(
+    model_id: &str,
+    reasoning_effort: Option<ReasoningEffort>,
+    fast_active: bool,
+) -> String {
+    let base = format_model_name(model_id);
+    let effort = reasoning_effort
+        .map(presence_effort_label)
+        .unwrap_or_default();
+    let label = if effort.is_empty() {
+        base
+    } else {
+        format!("{base} {effort}")
+    };
+    if fast_active {
+        format!("⚡ {label}")
+    } else {
+        label
+    }
+}
+
+fn presence_effort_label(effort: ReasoningEffort) -> &'static str {
+    match effort {
+        ReasoningEffort::Minimal => "Minimal",
+        ReasoningEffort::Low => "Low",
+        ReasoningEffort::Medium => "Medium",
+        ReasoningEffort::High => "High",
+        ReasoningEffort::XHigh => "XHigh",
+    }
+}
+
+fn activity_presence_text(
+    activity: &crate::session::SessionActivitySnapshot,
+    show_target: bool,
+) -> String {
+    if show_target
+        && let Some(target) = &activity.target
+        && !target.trim().is_empty()
+    {
+        return format!("{} {}", activity.action_text(), target);
+    }
+    activity.action_text().to_string()
+}
+
 fn context_state_part(session: &CodexSessionSnapshot) -> Option<String> {
     let context = session.context_window.as_ref()?;
     Some(format!("Ctx {:.0}%", context.remaining_percent))
+}
+
+fn cost_tokens_state_part(
+    session: &CodexSessionSnapshot,
+    config: &PresenceConfig,
+) -> Option<String> {
+    let mut parts = Vec::new();
+    if config.privacy.show_cost && session.total_cost_usd > 0.0 {
+        parts.push(format_cost(session.total_cost_usd));
+    }
+    if config.privacy.show_tokens
+        && let Some(total) = session.session_total_tokens
+        && total > 0
+    {
+        parts.push(format!("{} tok", format_tokens(total)));
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(" / "))
+    }
 }
 
 fn limits_state_part(limits: &RateLimits) -> Option<String> {
@@ -849,7 +918,7 @@ mod tests {
     }
 
     #[test]
-    fn state_uses_compact_model_plan_summary() {
+    fn state_uses_compact_usage_summary() {
         let session = sample_session();
         let config = PresenceConfig::default();
         let plan = resolved_plan_pro();
@@ -861,9 +930,9 @@ mod tests {
             &service_tier,
             &config,
         );
-        assert_eq!(state, "GPT-5.3-Codex · Pro");
-        assert!(!state.contains('$'));
-        assert!(!state.contains("tok"));
+        assert_eq!(state, "GPT-5.3-Codex · Ctx 94% · $1.23 / 30.0K tok");
+        assert!(state.contains('$'));
+        assert!(state.contains("tok"));
         assert!(!state.contains("5h"));
     }
 
@@ -882,8 +951,8 @@ mod tests {
             &config,
         );
         let model_pos = state.find("GPT-5.3-Codex-Ultra-Long-Variant-Name-For-Tests");
-        assert!(model_pos.is_some(), "state must keep model+plan");
-        assert!(!state.contains('$'), "state should stay visually compact");
+        assert!(model_pos.is_some(), "state must keep model summary");
+        assert!(state.contains('$'), "state should include cost summary");
     }
 
     #[test]
@@ -908,7 +977,7 @@ mod tests {
             &service_tier,
             &config,
         );
-        assert_eq!(details, "Codex · project-alpha (feature/main)");
+        assert_eq!(details, "Codex · project-alpha · feature/main");
     }
 
     #[test]
@@ -944,9 +1013,9 @@ mod tests {
             &service_tier,
             &config,
         );
-        assert_eq!(details, "Codex · project-alpha (feature/main)");
+        assert_eq!(details, "Codex · project-alpha · feature/main");
         assert!(state.contains("GPT-5.3-Codex"));
-        assert!(state.contains("Editing"));
+        assert!(state.contains("Editing main.rs"));
     }
 
     #[test]
@@ -963,7 +1032,7 @@ mod tests {
             &service_tier,
             &config,
         );
-        assert!(state.contains("⚡ GPT-5.3-Codex (Extra High) · Pro"));
+        assert!(state.contains("⚡ GPT-5.3-Codex XHigh"));
     }
 
     #[test]
