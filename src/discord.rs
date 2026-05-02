@@ -28,12 +28,14 @@ pub struct DiscordPresence {
     last_reconnect_attempt: Option<Instant>,
     consecutive_errors: u32,
     idle_start_epoch: Option<i64>,
+    idle_presence_hidden: bool,
 }
 
 const DISCORD_MIN_PUBLISH_INTERVAL: Duration = Duration::from_secs(2);
 const DISCORD_ASSET_REFRESH_INTERVAL: Duration = Duration::from_secs(300);
 const DISCORD_ASSET_FETCH_TIMEOUT: Duration = Duration::from_secs(2);
 const DISCORD_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
+const IDLE_CLEAR_AFTER_SECS: i64 = 30 * 60;
 const RECONNECT_MIN_BACKOFF: Duration = Duration::from_secs(5);
 const RECONNECT_MAX_BACKOFF: Duration = Duration::from_secs(60);
 
@@ -64,6 +66,7 @@ impl DiscordPresence {
             last_reconnect_attempt: None,
             consecutive_errors: 0,
             idle_start_epoch: None,
+            idle_presence_hidden: false,
         }
     }
 
@@ -104,6 +107,7 @@ impl DiscordPresence {
         match active_session {
             Some(session) => {
                 self.idle_start_epoch = None;
+                self.idle_presence_hidden = false;
                 let (name, details, state) = presence_lines(
                     session,
                     effective_limits,
@@ -178,6 +182,18 @@ impl DiscordPresence {
             }
             None => {
                 let idle_start = idle_start_epoch(&mut self.idle_start_epoch);
+                let now_epoch = Utc::now().timestamp().max(0);
+                if idle_presence_should_hide(idle_start, now_epoch) {
+                    if !self.idle_presence_hidden {
+                        self.clear_activity()?;
+                        self.last_sent = None;
+                        self.idle_presence_hidden = true;
+                    }
+                    self.last_status = "Connected (idle hidden)".to_string();
+                    return Ok(());
+                }
+                self.idle_presence_hidden = false;
+
                 let branding = display_branding(self.surface, config);
 
                 let details = branding.idle_details.to_string();
@@ -255,6 +271,7 @@ impl DiscordPresence {
         self.last_heartbeat_at = None;
         self.last_asset_refresh_at = None;
         self.idle_start_epoch = None;
+        self.idle_presence_hidden = false;
         self.reconnect_backoff = RECONNECT_MIN_BACKOFF;
         self.last_reconnect_attempt = None;
         self.consecutive_errors = 0;
@@ -362,6 +379,7 @@ impl DiscordPresence {
         self.reconnect_backoff = RECONNECT_MIN_BACKOFF;
         self.consecutive_errors = 0;
         self.idle_start_epoch = None;
+        self.idle_presence_hidden = false;
         self.last_status = status_for_client_id(self.surface, self.client_id.as_deref());
     }
 }
@@ -471,6 +489,10 @@ fn should_skip_publish(
 
 fn idle_start_epoch(idle_start_epoch: &mut Option<i64>) -> i64 {
     *idle_start_epoch.get_or_insert_with(|| Utc::now().timestamp().max(0))
+}
+
+fn idle_presence_should_hide(idle_start_epoch: i64, now_epoch: i64) -> bool {
+    now_epoch.saturating_sub(idle_start_epoch) >= IDLE_CLEAR_AFTER_SECS
 }
 
 fn presence_start_epoch(session: &CodexSessionSnapshot) -> i64 {
@@ -922,6 +944,28 @@ mod tests {
         let first = idle_start_epoch(&mut idle);
         let second = idle_start_epoch(&mut idle);
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn idle_presence_hides_after_timeout() {
+        let idle_start = 100;
+        assert!(!idle_presence_should_hide(
+            idle_start,
+            idle_start + IDLE_CLEAR_AFTER_SECS - 1
+        ));
+        assert!(idle_presence_should_hide(
+            idle_start,
+            idle_start + IDLE_CLEAR_AFTER_SECS
+        ));
+        assert!(idle_presence_should_hide(
+            idle_start,
+            idle_start + IDLE_CLEAR_AFTER_SECS + 1
+        ));
+    }
+
+    #[test]
+    fn idle_presence_stays_visible_when_clock_moves_back() {
+        assert!(!idle_presence_should_hide(100, 90));
     }
 
     #[test]
